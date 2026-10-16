@@ -1,0 +1,22 @@
+{
+  "builtOn": "2026-10-16",
+  "xcode": "27.0 (27A5228h)",
+  "swift": "Apple Swift 6.4 (swiftlang-6.4.0.27.1 clang-2100.3.27.1)",
+  "modules": [
+    {
+      "path": "native/serve-sim-native.node",
+      "serveSimVersion": "0.1.48",
+      "serveSimGitHead": "6d009686ed08f7d8bd19bca9f9f67a9237931f44",
+      "target": "arm64-apple-macosx14.0",
+      "command": "npm run build:native",
+      "sha256": "bb01fbdd03bd0a1d506986b1d86e3de91967b077bc5eb6a2dc7e86710a1fc7a2"
+    },
+    {
+      "path": "native/simulator-pasteboard",
+      "source": "native/Pasteboard.swift",
+      "target": "arm64-apple-ios15.0-simulator",
+      "command": "npm run build:pasteboard",
+      "sha256": "32a8b439a124aa75784445752d2f941397674ab7b48fa35e8bfb9f5243b0f035"
+    }
+  ]
+}

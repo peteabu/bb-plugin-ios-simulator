@@ -1,0 +1,13 @@
+{
+  "name": "bb-ios-simulator-native-build",
+  "version": "0.1.48-bb.0",
+  "private": true,
+  "description": "Build-only dependencies for the patched serve-sim 0.1.48 native capture module.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24"
+  },
+  "dependencies": {
+    "node-swift": "1.5.1"
+  }
+}

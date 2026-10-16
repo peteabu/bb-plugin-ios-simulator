@@ -1,0 +1,13 @@
+dist/
+.claude/
+.DS_Store
+node_modules/
+native/.build/
+native/.cache/
+native/.modcache/
+native/.npm-cache/
+native/.swiftpm-config/
+native/.swiftpm-security/
+native/serve-sim/node_modules/
+
+# The release intentionally includes native/serve-sim-native.node.
