@@ -19,14 +19,21 @@ describe("replay panel", () => {
     const fetch = vi.fn(async () => ({ ok: true, json: async () => CLIP }));
     vi.stubGlobal("fetch", fetch);
     const onModeChange = vi.fn();
-    const slot = renderSlot({ component: ReplayPanel }, { base: "/plugin", threadId: "thr_1", udid: "device", status: STATUS, onModeChange, onSaved() {} }, {
+    const slot = renderSlot({ component: ReplayPanel }, { base: "/plugin", threadId: "thr_1", udid: "device", status: STATUS, onModeChange, onSaved() {}, children: <div>Live device</div> }, {
       rpc: { timeline: () => [], replayState: () => STATUS, saveReplay: () => CLIP },
     });
-    fireEvent.click(slot.getByRole("button", { name: "Save last 30s" }));
+    expect(slot.getByText("Live device")).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Activity" }).getAttribute("aria-expanded")).toBe("false");
+    expect(slot.queryByText("App logs available")).toBeNull();
+    expect(slot.queryByRole("link", { name: "Download replay JSON" })).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "Capture 30s" }));
     await slot.findByRole("slider", { name: "Replay position" });
     await waitFor(() => expect(instance.seek).toHaveBeenCalledWith(1000));
     expect(slot.inspection.rpcCalls).toContainEqual({ method: "saveReplay", input: { threadId: "thr_1", udid: "device" } });
     expect(fetch.mock.calls[0]![0]).toContain("threadId=thr_1&id=clip_1");
+    expect(slot.queryByText("Live device")).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "Activity" }));
+    expect(slot.getByRole("region", { name: "Replay activity" })).toBeTruthy();
     const download = slot.getByRole("link", { name: "Download replay JSON" });
     expect(download.getAttribute("download")).toBe("simulator-replay-clip_1.json");
     expect(download.getAttribute("href")).toContain("download=1");
@@ -35,6 +42,7 @@ describe("replay panel", () => {
     expect(slot.queryByRole("application")).toBeNull();
     fireEvent.click(slot.getByRole("button", { name: "Live", exact: true }));
     await waitFor(() => expect(instance.dispose).toHaveBeenCalledTimes(1));
+    expect(slot.getByText("Live device")).toBeTruthy();
     expect(onModeChange).toHaveBeenLastCalledWith(false);
     expect(fetch.mock.calls[0]![1].signal.aborted).toBe(true);
     slot.lifecycle.unmount();
@@ -49,12 +57,15 @@ describe("replay panel", () => {
       rpc: { timeline: () => events, replayState: state },
     });
     await act(async () => { await Promise.resolve(); });
-    expect((slot.getByRole("button", { name: "Save last 30s" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((slot.getByRole("button", { name: "Capture 30s" }) as HTMLButtonElement).disabled).toBe(true);
     expect(slot.queryByText("Log 0")).toBeNull();
+    expect(slot.queryByText("Log 149")).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "Activity" }));
     expect(slot.getByText("Log 149")).toBeTruthy();
+    expect(slot.queryByText("Log 49")).toBeNull();
     ready = true;
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
-    expect((slot.getByRole("button", { name: "Save last 30s" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((slot.getByRole("button", { name: "Capture 30s" }) as HTMLButtonElement).disabled).toBe(false);
     expect(state).toHaveBeenCalledTimes(2);
     slot.lifecycle.unmount();
     await vi.advanceTimersByTimeAsync(4000);
@@ -69,9 +80,24 @@ describe("replay panel", () => {
     const slot = renderSlot({ component: ReplayPanel }, { base: "/plugin", threadId: "thr_1", udid: "device", status: STATUS, onModeChange, onSaved() {} }, {
       rpc: { timeline: () => [], replayState: () => STATUS, saveReplay: () => pending },
     });
-    fireEvent.click(slot.getByRole("button", { name: "Save last 30s" }));
+    fireEvent.click(slot.getByRole("button", { name: "Capture 30s" }));
     slot.lifecycle.unmount();
     await act(async () => { finish(CLIP); await pending; });
     expect(onModeChange).not.toHaveBeenCalled();
+  });
+
+  it("reveals an empty activity drawer without replacing the live device", async () => {
+    const slot = renderSlot({ component: ReplayPanel }, { base: "/plugin", threadId: "thr_1", udid: "device", status: STATUS, onModeChange() {}, onSaved() {}, children: <div>Live device</div> }, {
+      rpc: { timeline: () => [], replayState: () => STATUS },
+    });
+    expect(slot.queryByRole("region", { name: "Recent activity" })).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "Activity" }));
+    expect(slot.getByText("No activity yet")).toBeTruthy();
+    expect(slot.getByText("Live device")).toBeTruthy();
+    expect(slot.getByText("App logs available")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Activity" }));
+    expect(slot.queryByRole("region", { name: "Recent activity" })).toBeNull();
+    expect(slot.queryByText("App logs available")).toBeNull();
+    slot.lifecycle.unmount();
   });
 });

@@ -69,9 +69,12 @@ See the [replay/control design](docs/REPLAY_AND_CONTROL.md) and
 ## Replay and shared control
 
 The iOS backend keeps up to 30 seconds of video and timestamped input in
-memory while attached. **Save last 30s** captures the available window; choose
+memory while attached. **Capture 30s** captures the available window; choose
 Replay to play, pause, scrub, or jump to a timeline event. Replay cannot send
 input to the live device. **Live** returns to the current simulator.
+Open **Activity** for the event timeline, app diagnostics and replay downloads.
+The control dock keeps Home, Lock, Rotate and Screenshot in reach; **Device
+options** contains volume, stream details, Detach and Shut down.
 
 Replays are temporary: detaching or reloading clears them. Download replay
 JSON to retain the encoded H.264 video, timing, orientation and events.

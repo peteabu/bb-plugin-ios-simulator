@@ -255,7 +255,7 @@ describe("iOS Simulator app", () => {
       }, context: { projectId: "p", threadId: "thr_1" },
     });
     const surface = await slot.findByRole("application");
-    await slot.findByText("Another thread controls");
+    await slot.findByText("Viewing another thread");
     expect(surface.getAttribute("aria-disabled")).toBe("true");
     expect((slot.getByRole("button", { name: "Home (⌘⇧H)" }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.keyDown(surface, { key: "a" });
@@ -263,13 +263,13 @@ describe("iOS Simulator app", () => {
     expect(send).not.toHaveBeenCalled();
     expect(slot.inspection.rpcCalls.some((call) => call.method === "pasteText")).toBe(false);
     fireEvent.click(slot.getByRole("button", { name: "Take control" }));
-    await slot.findByText("You control");
+    await slot.findByText("You’re driving");
     expect(slot.inspection.rpcCalls).toContainEqual({ method: "control", input: { threadId: "thr_1", udid: "AAAA-2", mode: "human" } });
     expect(surface.getAttribute("aria-disabled")).toBe("false");
     fireEvent.paste(surface, { clipboardData: { getData: () => "allowed" } });
     await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "pasteText", input: { threadId: "thr_1", udid: "AAAA-2", text: "allowed" } }));
     fireEvent.click(slot.getByRole("button", { name: "Let agent drive" }));
-    await slot.findByText("Agent controls");
+    await slot.findByText("Agent driving");
     fireEvent.keyDown(surface, { key: "b" });
     fireEvent.paste(surface, { clipboardData: { getData: () => "blocked again" } });
     expect(send).not.toHaveBeenCalled();
@@ -302,8 +302,7 @@ describe("iOS Simulator app", () => {
     fireEvent.click(slot.getByRole("button", { name: "Replay", exact: true }));
     const canvas = await slot.findByLabelText("Saved simulator replay");
     await waitFor(() => expect(slot.queryByRole("application")).toBeNull());
-    expect((slot.getByRole("button", { name: "Home (⌘⇧H)" }) as HTMLButtonElement).disabled).toBe(true);
-    expect((slot.getByRole("button", { name: "Save screenshot (⌘S)" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(slot.queryByRole("group", { name: "Simulator controls" })).toBeNull();
     fireEvent.keyDown(canvas, { key: "a" });
     fireEvent.paste(canvas, { clipboardData: { getData: () => "do not type into live device" } });
     expect(send).not.toHaveBeenCalled();
@@ -331,7 +330,7 @@ describe("iOS Simulator app", () => {
     await slot.findByRole("button", { name: "Attach", exact: true });
     expect(slot.queryByRole("button", { name: "Take control" })).toBeNull();
     expect(slot.queryByRole("button", { name: "Let agent drive" })).toBeNull();
-    expect(slot.queryByRole("button", { name: "Save last 30s" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "Capture 30s" })).toBeNull();
     expect((slot.getByRole("button", { name: "Home (⌘⇧H)" }) as HTMLButtonElement).disabled).toBe(true);
     expect(slot.inspection.rpcCalls.filter((call) => ["timeline", "replayState", "control"].includes(call.method))
       .some((call) => (call.input as { udid?: string }).udid === "AAAA-1")).toBe(false);
@@ -366,7 +365,14 @@ describe("iOS Simulator app", () => {
     await waitFor(() => expect(slot.inspection.rpcCalls.filter((call) => call.method === "button")).toHaveLength(1));
     expect(home.getAttribute("aria-busy")).toBe("true");
     expect((home as HTMLButtonElement).disabled).toBe(true);
+    expect(slot.queryByRole("button", { name: "Volume up (⌘↑)" })).toBeNull();
+    const options = slot.getByRole("button", { name: "Device options" });
+    fireEvent.click(options);
+    expect(options.getAttribute("aria-expanded")).toBe("true");
     expect((slot.getByRole("button", { name: "Volume up (⌘↑)" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(slot.queryByRole("button", { name: "Volume up (⌘↑)" })).toBeNull();
+    expect(document.activeElement).toBe(options);
     finish({ ok: true });
     await waitFor(() => expect((home as HTMLButtonElement).disabled).toBe(false));
     slot.lifecycle.unmount();

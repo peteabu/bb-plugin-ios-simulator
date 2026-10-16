@@ -35,7 +35,7 @@ independent of the iOS video recording path.
   input connections. Stop input from old owners even if
   their UI is stale. Release ownership when its thread detaches or disappears.
 - The panel displays who controls the device, Take control / Let agent drive,
-  replay readiness, Save last 30s, playback with a synchronized event timeline,
+  replay readiness, Capture 30s, playback with a synchronized event timeline,
   and return to Live. Replay never sends input to the live device. Downloads
   contain the captured replay and events; no external service is required.
 

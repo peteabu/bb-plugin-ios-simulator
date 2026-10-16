@@ -1,11 +1,10 @@
-// The iOS Simulator tab: a device picker, the live MJPEG stream with touch
-// and keyboard relayed over the plugin's HID WebSocket, hardware buttons,
-// and the agent-consent switch. Mirrors Apple's Simulator shortcuts.
-import { useCallback, useEffect, useRef, useState } from "react";
+// The shared iOS device stage, replay controls, and human/agent handoff.
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
+  ReactNode,
 } from "react";
 import {
   experimental_usePluginId as usePluginId,
@@ -428,7 +427,7 @@ function DeviceScreen({
   return (
     <div
       ref={containerRef}
-      className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-muted/30"
+      className="simulator-stage relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-muted/15"
     >
       <div
         className={cn("relative", localFit ? "drop-shadow-xl" : "bg-neutral-900 shadow-xl ring-1 ring-black/40")}
@@ -532,7 +531,7 @@ function DeviceScreen({
         ) : null}
         {inputShadowed ? (
           <div className="pointer-events-none absolute inset-x-3 bottom-3 rounded-lg bg-background/90 px-2.5 py-1.5 text-center text-[11px] text-foreground shadow">
-            Input is captured by Xcode's Device Hub. Use Repair input below.
+            Input paused by Xcode. Choose Repair input above.
           </div>
         ) : null}
         {agentActive ? (
@@ -556,14 +555,12 @@ function ControlButton({
   label,
   onClick,
   disabled,
-  destructive,
   pending,
 }: {
   icon: string;
   label: string;
   onClick: () => void;
   disabled?: boolean;
-  destructive?: boolean;
   pending?: boolean;
 }) {
   return (
@@ -571,16 +568,49 @@ function ControlButton({
       <Button
         variant="ghost"
         size="icon"
-        className={cn("size-10 shrink-0 text-muted-foreground transition-transform hover:text-foreground active:scale-[0.96]", pending && "bg-accent text-foreground", destructive && "hover:text-destructive")}
+        className={cn("size-10 shrink-0 rounded-lg text-muted-foreground transition-[background-color,color,transform] duration-150 hover:text-foreground active:scale-[0.96] motion-reduce:transition-none", pending && "bg-accent text-foreground")}
         aria-label={label}
         aria-busy={pending || undefined}
         onClick={onClick}
         disabled={disabled || pending}
       >
-        <Icon name={icon} className="size-4" />
+        {pending ? <svg aria-hidden="true" viewBox="0 0 24 24" className="size-4 animate-spin motion-reduce:animate-none" fill="none" stroke="currentColor" strokeWidth="1.7"><circle cx="12" cy="12" r="9" opacity=".2" /><path d="M12 3a9 9 0 0 1 9 9" strokeLinecap="round" /></svg> : <Icon name={icon} className="size-4" />}
       </Button>
     </span>
   );
+}
+
+function DeviceOptions({ children }: { children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const id = useId();
+  useEffect(() => {
+    if (!open) return;
+    const outside = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault(); setOpen(false); trigger.current?.focus();
+    };
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", escape);
+    return () => { document.removeEventListener("pointerdown", outside); document.removeEventListener("keydown", escape); };
+  }, [open]);
+  return <div ref={root} className="relative" onBlur={(event) => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false);
+  }}>
+    <span title="Device options" className="inline-flex">
+      <Button ref={trigger} variant="ghost" size="icon" className="size-10 rounded-lg text-muted-foreground transition-[background-color,color,transform] duration-150 active:scale-[0.96] motion-reduce:transition-none"
+        aria-label="Device options" aria-expanded={open} aria-controls={open ? id : undefined} onClick={() => setOpen(!open)}>
+        <svg aria-hidden="true" className="size-4" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7" /><circle cx="12" cy="12" r="1.7" /><circle cx="19" cy="12" r="1.7" /></svg>
+      </Button>
+    </span>
+    {open ? <div id={id} role="group" aria-label="Device options" className="simulator-options absolute bottom-full right-0 z-20 mb-2 w-60 rounded-xl border border-border/60 bg-background p-1.5 text-xs shadow-xl">
+      {children}
+    </div> : null}
+  </div>;
 }
 
 function deviceLabel(device: Device): string {
@@ -655,8 +685,8 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
   const controller = activeUdid ? state?.controls[activeUdid] : undefined;
   const ownsHumanControl = isAttached && controller?.threadId === threadId && controller.mode === "human";
   const canDrive = ownsHumanControl && !replaying && busy !== "control";
-  const controlLabel = !controller ? "Watching only" : controller.threadId !== threadId
-    ? "Another thread controls" : controller.mode === "human" ? "You control" : "Agent controls";
+  const controlLabel = busy === "control" ? "Changing control…" : !controller ? "View only" : controller.threadId !== threadId
+    ? "Viewing another thread" : controller.mode === "human" ? "You’re driving" : "Agent driving";
   const agentActive =
     activeUdid !== null && Date.now() - (activity[activeUdid] ?? 0) < AGENT_BADGE_MS;
 
@@ -767,14 +797,33 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
 
   const problems = state?.ready.problems ?? [];
   const inputShadowed = activeUdid !== null && (state?.inputShadowed ?? []).includes(activeUdid);
+  const liveStage = activeSession && activeUdid ? <DeviceScreen
+    key={`${activeUdid}:${activeSession.startedAt}`}
+    udid={activeUdid} threadId={threadId} session={activeSession} base={base}
+    kind={deviceKindFor(activeDevice?.name)} agentActive={agentActive}
+    inputShadowed={inputShadowed} inputEnabled={canDrive}
+    onShortcut={onShortcut} onConfig={setScreen} onStats={setVideoStats}
+    onPasteText={(text) => {
+      if (canDrive) rpc.call("pasteText", { threadId, udid: activeUdid, text }).catch((cause) => toast.error(describe(cause)));
+    }}
+  /> : null;
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-background text-foreground antialiased tabular-nums">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
-        <Icon name="Smartphone" className="size-4 shrink-0 text-muted-foreground" />
+    <div className="simulator-panel @container flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground antialiased tabular-nums">
+      <div className="simulator-header flex shrink-0 items-center gap-2 border-b border-border/60 px-3 py-2">
+        <div className="relative flex min-h-10 min-w-0 flex-1 items-center gap-2 rounded-lg px-1 transition-colors duration-150 hover:bg-muted/60 focus-within:ring-1 focus-within:ring-ring motion-reduce:transition-none">
+          <Icon name="Smartphone" className="hidden size-4 shrink-0 text-muted-foreground @[360px]:block" />
+          <div className="min-w-0 flex-1 py-0.5">
+            <p className="truncate text-xs font-medium">{activeDevice?.name ?? (state ? "Select a device" : "Loading devices…")}</p>
+            <div className="mt-0.5 flex min-w-0 items-center gap-1.5 truncate text-[11px] text-muted-foreground">
+              {isAttached ? <span aria-hidden="true" className={cn("size-1.5 shrink-0 rounded-full", ownsHumanControl ? "bg-emerald-500" : "bg-muted-foreground/60")} /> : null}
+              <span role="status" title={isAttached ? controlLabel : undefined} className="truncate">{isAttached ? controlLabel : activeDevice?.runtime ?? "iOS Simulator"}</span>
+            </div>
+          </div>
+          <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5 shrink-0 text-muted-foreground" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="m5 6 3 3 3-3" strokeLinecap="round" strokeLinejoin="round" /></svg>
         <select
           aria-label="Simulator device"
-          className="h-8 min-w-0 flex-1 truncate rounded-md border border-input bg-background px-2 text-sm outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          className="absolute inset-0 h-full w-full cursor-pointer opacity-0 disabled:cursor-default"
           value={activeUdid ?? ""}
           onChange={(event) => setSelected(event.target.value || null)}
           disabled={devices.length === 0}
@@ -801,19 +850,23 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
               ))}
           </optgroup>
         </select>
-        {isAttached ? (
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => detach(false)}
-            disabled={busy !== null}
-                >
-            <Icon name={glyph("unplug")} className="size-4" />
-            Detach
+        </div>
+        {isAttached && activeSession ? <span title={ownsHumanControl && state?.agentControl === "never" ? "Agent control is turned off in plugin settings" : undefined}>
+          <Button size="sm" variant={ownsHumanControl ? "ghost" : "secondary"}
+            className="h-10 shrink-0 rounded-lg px-3 transition-[background-color,color,transform] duration-150 active:scale-[0.96] motion-reduce:transition-none"
+            aria-label={ownsHumanControl ? "Let agent drive" : "Take control"} aria-busy={busy === "control" || undefined}
+            disabled={busy === "control" || (ownsHumanControl && state?.agentControl === "never")}
+            onClick={() => handoff(ownsHumanControl ? "agent" : "human")}>
+            {busy === "control" ? <Icon name={glyph("spinner")} className="size-3.5 animate-spin motion-reduce:animate-none" /> :
+              <svg aria-hidden="true" viewBox="0 0 24 24" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                <path d={ownsHumanControl ? "M4 12h15m-6-6 6 6-6 6" : "m4 3 7 18 2-8 8-2z"} />
+              </svg>}
+            {ownsHumanControl ? "Let agent drive" : "Take control"}
           </Button>
-        ) : (
+        </span> : (
           <Button
             size="sm"
+            className="h-10 min-w-20 rounded-lg transition-[background-color,color,transform] duration-150 active:scale-[0.96] motion-reduce:transition-none"
             onClick={() => void attach(activeUdid)}
             disabled={busy !== null || (devices.length === 0 && problems.length > 0)}
                 >
@@ -826,15 +879,6 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
           </Button>
         )}
       </div>
-
-      {isAttached && activeSession && activeUdid ? <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-1.5">
-        <span role="status" className="text-xs text-muted-foreground">{controlLabel}{replaying ? " · Viewing replay" : ""}</span>
-        <span title={ownsHumanControl && state?.agentControl === "never" ? "Agent control is turned off in plugin settings" : undefined}>
-        <Button size="sm" variant="outline" disabled={busy === "control" || (ownsHumanControl && state?.agentControl === "never")} onClick={() => handoff(ownsHumanControl ? "agent" : "human")}>
-          {busy === "control" ? "Changing control…" : ownsHumanControl ? "Let agent drive" : "Take control"}
-        </Button>
-        </span>
-      </div> : null}
 
       {error ? (
         <p role="alert" className="border-b border-border px-3 py-2 text-xs text-destructive">
@@ -857,17 +901,15 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
       ) : null}
 
       {inputShadowed ? (
-        <div className="flex items-start gap-2 border-b border-border px-3 py-2">
+        <div className="mx-3 my-2 flex shrink-0 items-start gap-2 rounded-xl bg-muted/70 px-3 py-3">
           <Icon name="AlertTriangle" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
           <div className="min-w-0 flex-1">
-            <p className="text-xs font-medium">Xcode's Device Hub has taken over input</p>
+            <p className="text-xs font-medium">Input paused by Xcode</p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              Taps and keys from this panel and from agents are ignored while Device Hub
-              shows this device. Repair hands input back; it restarts SpringBoard and
-              closes running apps. Closing the device window in Device Hub avoids it.
+              Close this device in Device Hub to resume. Repair restarts the simulator and closes apps.
             </p>
           </div>
-          <Button size="sm" variant="outline" onClick={repairInput} disabled={busy !== null || !canDrive}>
+          <Button size="sm" variant="outline" className="h-10 shrink-0" onClick={repairInput} disabled={busy !== null || !canDrive}>
             <Icon
               name={glyph(busy === "repair" ? "spinner" : "wrench")}
               className={cn("size-4", busy === "repair" && "animate-spin")}
@@ -877,75 +919,62 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
         </div>
       ) : null}
 
-      {isAttached && activeSession && activeUdid ? <ReplayPanel key={`${threadId}:${activeUdid}`} base={base} threadId={threadId} udid={activeUdid}
-        status={state?.replay[activeUdid]} onModeChange={setReplaying} onSaved={refetch} /> : null}
-
-      {activeSession && activeUdid ? (!replaying ? (
-        <DeviceScreen
-          key={`${activeUdid}:${activeSession.startedAt}`}
-          udid={activeUdid}
-          threadId={threadId}
-          session={activeSession}
-          base={base}
-          kind={deviceKindFor(activeDevice?.name)}
-          agentActive={agentActive}
-          inputShadowed={inputShadowed}
-          inputEnabled={canDrive}
-          onShortcut={onShortcut}
-          onConfig={setScreen}
-          onStats={setVideoStats}
-          onPasteText={(text) => {
-            if (canDrive) rpc.call("pasteText", { threadId, udid: activeUdid, text }).catch((cause) => toast.error(describe(cause)));
-          }}
-        />
-      ) : null) : (
+      {liveStage ? (isAttached && activeUdid ? <ReplayPanel key={`${threadId}:${activeUdid}`} base={base} threadId={threadId} udid={activeUdid}
+        status={state?.replay[activeUdid]} onModeChange={setReplaying} onSaved={refetch}>{liveStage}</ReplayPanel> : liveStage) : (
         <div className="flex min-h-0 flex-1 items-center justify-center p-6">
           <div className="max-w-xs text-center">
-            <Icon name="Smartphone" className="mx-auto size-8 text-muted-foreground" />
-            <p className="mt-3 text-sm font-medium">
+            <div className="mx-auto flex size-14 items-center justify-center rounded-2xl bg-muted/70"><Icon name="Smartphone" className="size-6 text-muted-foreground" /></div>
+            <p className="mt-4 text-sm font-medium text-balance">
               {state === null
                 ? "Loading…"
                 : devices.length === 0
                   ? "No iOS simulators yet"
-                  : "No simulator attached"}
+                  : "Your app, right here"}
             </p>
-            <p className="mt-1 text-xs text-muted-foreground">
+            <p className="mt-2 text-xs leading-relaxed text-pretty text-muted-foreground">
               {state === null
                 ? ""
                 : devices.length === 0
                   ? "Install the iOS platform in Xcode → Settings → Components, then come back."
-                  : "Pick a device and press Attach, or ask the agent to run the app. It boots the simulator, streams it here, and you can tap along."}
+                  : "Choose a device and attach it, or ask your agent to run the app. You’ll share the same screen."}
             </p>
           </div>
         </div>
       )}
 
-      {activeSession && activeUdid ? (
-        <div className="shrink-0 border-t border-border px-2 py-1.5">
-          <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Simulator controls">
+      {activeSession && activeUdid && !replaying ? (
+        <div className="simulator-footer flex shrink-0 justify-center bg-muted/15 px-3 pb-3 pt-1">
+          <div className="simulator-control-dock flex items-center gap-0.5 rounded-2xl bg-background p-1 shadow-sm ring-1 ring-border/60" role="group" aria-label="Simulator controls">
           <ControlButton icon={glyph("home")} label="Home (⌘⇧H)" onClick={() => pressButton("home")} disabled={!canDrive} pending={controlPending("home")} />
           <ControlButton icon={glyph("lock")} label="Lock (⌘L)" onClick={() => pressButton("lock")} disabled={!canDrive} pending={controlPending("lock")} />
-          <ControlButton icon={glyph("volume-up")} label="Volume up (⌘↑)" onClick={() => pressButton("volume-up")} disabled={!canDrive} pending={controlPending("volume-up")} />
-          <ControlButton icon={glyph("volume-down")} label="Volume down (⌘↓)" onClick={() => pressButton("volume-down")} disabled={!canDrive} pending={controlPending("volume-down")} />
           <ControlButton icon={glyph("rotate")} label="Rotate (⌘→)" onClick={rotate} disabled={!canDrive} pending={controlPending("rotate")} />
           <ControlButton icon={glyph("camera")} label="Save screenshot (⌘S)" onClick={screenshot} />
-          <span className="flex-1" />
-          <ControlButton
-            icon={glyph("power")}
-            label="Shut down the simulator"
-            onClick={() => detach(true)}
-            disabled={busy !== null || !canDrive}
-            destructive
-          />
-          </div>
-          <div
-            className="h-4 truncate px-1 font-mono text-[11px] leading-4 text-muted-foreground"
-            title="Codec · painted frames per second (decoded) · decoder queue · stream bandwidth"
-          >
-            {videoStats
-              ? `H.264 · ${videoStats.paintedFps} fps (${videoStats.decodedFps}) · q${videoStats.queue} · ${Math.round(videoStats.bytesPerSecond / 1024)} KB/s`
-              : "MJPEG fallback"}
-            {screen ? ` · ${screen.width}×${screen.height}` : ""}
+          <span aria-hidden="true" className="mx-1 h-4 w-px bg-border/60" />
+          <DeviceOptions key={activeUdid}>
+            <div className="flex items-center justify-between gap-2 rounded-lg px-2 py-1">
+              <span className="text-muted-foreground">Volume</span>
+              <div className="flex gap-1">
+                <ControlButton icon={glyph("volume-down")} label="Volume down (⌘↓)" onClick={() => pressButton("volume-down")} disabled={!canDrive} pending={controlPending("volume-down")} />
+                <ControlButton icon={glyph("volume-up")} label="Volume up (⌘↑)" onClick={() => pressButton("volume-up")} disabled={!canDrive} pending={controlPending("volume-up")} />
+              </div>
+            </div>
+            <details className="border-t border-border/60 px-2 text-muted-foreground">
+              <summary className="flex min-h-10 cursor-pointer items-center">Stream details</summary>
+              <dl className="space-y-1 pb-3 text-[11px] tabular-nums">
+                <div className="flex justify-between"><dt>Format</dt><dd>{videoStats ? "H.264" : "Image stream"}</dd></div>
+                {screen ? <div className="flex justify-between"><dt>Resolution</dt><dd>{screen.width} × {screen.height}</dd></div> : null}
+                {videoStats ? <>
+                  <div className="flex justify-between"><dt>Frame rate</dt><dd>{videoStats.paintedFps} fps</dd></div>
+                  <div className="flex justify-between"><dt>Decode queue</dt><dd>{videoStats.queue}</dd></div>
+                  <div className="flex justify-between"><dt>Bandwidth</dt><dd>{Math.round(videoStats.bytesPerSecond / 1024)} KB/s</dd></div>
+                </> : null}
+              </dl>
+            </details>
+            <div className="space-y-0.5 border-t border-border/60 pt-1">
+              <Button size="sm" variant="ghost" className="h-10 w-full justify-start rounded-lg px-2" onClick={() => detach(false)} disabled={busy !== null || !isAttached}><Icon name={glyph("unplug")} />Detach</Button>
+              <Button size="sm" variant="ghost" className="h-10 w-full justify-start rounded-lg px-2 text-destructive hover:text-destructive" onClick={() => detach(true)} disabled={busy !== null || !canDrive}><Icon name={glyph("power")} />Shut down</Button>
+            </div>
+          </DeviceOptions>
           </div>
         </div>
       ) : null}
