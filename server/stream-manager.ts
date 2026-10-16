@@ -250,8 +250,9 @@ export class StreamManager {
 
   /** Start (or reuse) the stream for a booted device and wait until it serves frames. */
   async ensure(udid: string, signal?: AbortSignal): Promise<StreamSession> {
+    signal?.throwIfAborted();
     const existing = this.sessions.get(udid);
-    if (existing && !existing.exited) return existing.ready;
+    if (existing && !existing.exited) return cancellable(existing.ready, signal);
 
     const node = this.options.node();
     const entry = this.options.serveSim();
@@ -266,6 +267,7 @@ export class StreamManager {
       );
     }
     const port = await this.freePort();
+    signal?.throwIfAborted();
     const command = entry.kind === "script" ? node!.command : entry.path;
     const args = [
       ...(entry.kind === "script" ? [...node!.args, entry.path] : []),
@@ -320,11 +322,12 @@ export class StreamManager {
     session.ready = this.waitUntilHealthy(session, signal);
     try {
       const ready = await session.ready;
+      signal?.throwIfAborted();
       session.pacer = this.startPacer(session);
       this.options.onChange?.();
       return ready;
     } catch (error) {
-      await this.stop(udid);
+      if (this.sessions.get(udid) === session) await this.stop(udid);
       throw error;
     }
   }
@@ -406,7 +409,9 @@ export class StreamManager {
         );
       }
       try {
-        const response = await this.fetchFn(url, { signal: AbortSignal.timeout(2_000) });
+        const timeout = AbortSignal.timeout(2_000);
+        const response = await this.fetchFn(url, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+        signal?.throwIfAborted();
         if (response.ok) return this.publicSession(session);
       } catch {
         // not listening yet

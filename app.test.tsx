@@ -6,7 +6,9 @@ import { deviceKindFor, fitDevice, shortcutFor } from "./components/simulator-pa
 import { BEZEL_PARTS, fitBezel, type DeviceBezel } from "./lib/device-bezel";
 import { decodeHid, encodeHid, HID } from "./lib/sim-protocol";
 import * as videoStream from "./components/video-stream";
+import * as replayPlayer from "./components/replay-player";
 
+const REPLAY_STATUS = { recording: false, bufferedMs: 0, bytes: 0, error: null, app: null, diagnostics: null, clips: [] };
 const STATE = {
   ready: { ok: false, problems: ["Node.js 20 or newer was not found on PATH."], xcode: "/x", node: null, serveSim: "/s" },
   devices: [
@@ -17,6 +19,11 @@ const STATE = {
   attached: [],
   bootedByPlugin: [],
   consent: {},
+  controls: {
+    "AAAA-2": { threadId: "thr_1", mode: "human", changedAt: 1 },
+    "AAAA-1": { threadId: "thr_1", mode: "human", changedAt: 1 },
+  },
+  replay: {},
   inputShadowed: [],
   agentControl: "ask",
   error: null,
@@ -49,7 +56,7 @@ describe("iOS Simulator app", () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,
       { threadId: "thr_1", params: null },
-      { rpc: { state: () => STATE }, context: { projectId: "p", threadId: "thr_1" } },
+      { rpc: { timeline: () => [], replayState: () => REPLAY_STATUS, state: () => STATE }, context: { projectId: "p", threadId: "thr_1" } },
     );
     await slot.findByText(/Node\.js 20 or newer/);
     expect(slot.getByRole("option", { name: /iPhone 17 Pro/ })).toBeTruthy();
@@ -62,7 +69,7 @@ describe("iOS Simulator app", () => {
     const app = await loadPluginApp(() => import("./app"));
     let attached = ["AAAA-2"];
     const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
-      rpc: { state: () => ({ ...STATE, attached }) },
+      rpc: { timeline: () => [], replayState: () => REPLAY_STATUS, state: () => ({ ...STATE, attached }) },
       context: { projectId: "p", threadId: "thr_1" },
     });
     const select = await slot.findByRole<HTMLSelectElement>("combobox", { name: "Simulator device" });
@@ -82,7 +89,7 @@ describe("iOS Simulator app", () => {
     const app = await loadPluginApp(() => import("./app"));
     const state = vi.fn(() => ({ ...STATE, attached: ["AAAA-1", "AAAA-2"] }));
     const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
-      rpc: { state }, context: { projectId: "p", threadId: "thr_1" },
+      rpc: { timeline: () => [], replayState: () => REPLAY_STATUS, state }, context: { projectId: "p", threadId: "thr_1" },
     });
     const select = await slot.findByRole<HTMLSelectElement>("combobox", { name: "Simulator device" });
     await waitFor(() => expect(select.value).toBe("AAAA-1"));
@@ -176,7 +183,7 @@ describe("iOS Simulator app", () => {
     });
     const app = await loadPluginApp(() => import("./app"));
     const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
-      rpc: { state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] },
+      rpc: { timeline: () => [], replayState: () => REPLAY_STATUS, state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] },
         attached: ["AAAA-2"], sessions: [{ udid: "AAAA-2", port: 1234, startedAt: 1 }] }) },
       context: { projectId: "p", threadId: "thr_1" },
     });
@@ -210,7 +217,7 @@ describe("iOS Simulator app", () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => null })));
     const app = await loadPluginApp(() => import("./app"));
     const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
-      rpc: {
+      rpc: { timeline: () => [], replayState: () => REPLAY_STATUS,
         state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] },
           attached: ["AAAA-2"], sessions: [{ udid: "AAAA-2", port: 1234, startedAt: 1 }] }),
         pasteText: () => ({ ok: true }),
@@ -221,9 +228,113 @@ describe("iOS Simulator app", () => {
     const text = "Hello, 世界 👋";
     fireEvent.paste(surface, { clipboardData: { getData: () => text } });
     await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({
-      method: "pasteText", input: { udid: "AAAA-2", text },
+      method: "pasteText", input: { threadId: "thr_1", udid: "AAAA-2", text },
     }));
     expect(surface.parentElement?.getAttribute("data-bezel")).toBe("fallback");
+    slot.lifecycle.unmount();
+  });
+
+  it("requires explicit human control for panel input and sends scoped handoffs", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const sockets: string[] = [];
+    const send = vi.fn();
+    vi.stubGlobal("WebSocket", class {
+      static OPEN = 1; readyState = 1; send = send;
+      constructor(url: string) { sockets.push(url); }
+      close() {}
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => null })));
+    let controller = { threadId: "thr_other", mode: "agent", changedAt: 1 };
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
+      rpc: { timeline: () => [], replayState: () => REPLAY_STATUS,
+        state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] },
+          controls: { "AAAA-2": controller }, attached: ["AAAA-2"], sessions: [{ udid: "AAAA-2", port: 1, startedAt: 1 }] }),
+        control: (input: { mode: string }) => { controller = { threadId: "thr_1", mode: input.mode, changedAt: 2 }; return controller; },
+        pasteText: () => ({ ok: true }),
+      }, context: { projectId: "p", threadId: "thr_1" },
+    });
+    const surface = await slot.findByRole("application");
+    await slot.findByText("Another thread controls");
+    expect(surface.getAttribute("aria-disabled")).toBe("true");
+    expect((slot.getByRole("button", { name: "Home (⌘⇧H)" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.keyDown(surface, { key: "a" });
+    fireEvent.paste(surface, { clipboardData: { getData: () => "blocked" } });
+    expect(send).not.toHaveBeenCalled();
+    expect(slot.inspection.rpcCalls.some((call) => call.method === "pasteText")).toBe(false);
+    fireEvent.click(slot.getByRole("button", { name: "Take control" }));
+    await slot.findByText("You control");
+    expect(slot.inspection.rpcCalls).toContainEqual({ method: "control", input: { threadId: "thr_1", udid: "AAAA-2", mode: "human" } });
+    expect(surface.getAttribute("aria-disabled")).toBe("false");
+    fireEvent.paste(surface, { clipboardData: { getData: () => "allowed" } });
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "pasteText", input: { threadId: "thr_1", udid: "AAAA-2", text: "allowed" } }));
+    fireEvent.click(slot.getByRole("button", { name: "Let agent drive" }));
+    await slot.findByText("Agent controls");
+    fireEvent.keyDown(surface, { key: "b" });
+    fireEvent.paste(surface, { clipboardData: { getData: () => "blocked again" } });
+    expect(send).not.toHaveBeenCalled();
+    expect(slot.inspection.rpcCalls.filter((call) => call.method === "pasteText")).toHaveLength(1);
+    expect(slot.inspection.rpcCalls).toContainEqual({ method: "control", input: { threadId: "thr_1", udid: "AAAA-2", mode: "agent" } });
+    expect(sockets[0]).toContain("threadId=thr_1");
+    slot.lifecycle.unmount();
+  });
+
+  it("isolates replay from live input even while this human owns the device", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const send = vi.fn();
+    const close = vi.fn();
+    vi.stubGlobal("WebSocket", class { static OPEN = 1; readyState = 1; send = send; close = close; });
+    vi.spyOn(videoStream, "webCodecsAvailable").mockReturnValue(false);
+    const player = { seek: vi.fn(async () => {}), play: vi.fn(async () => {}), pause: vi.fn(), dispose: vi.fn() };
+    vi.spyOn(replayPlayer, "createReplayPlayer").mockReturnValue(player);
+    const clip = { id: "clip_1", udid: "AAAA-2", threadId: "thr_1", startAt: 1000, endAt: 1600, createdAt: 2000,
+      frameCount: 1, description: "AWQAHg==", frames: [], events: [] };
+    const replay = { ...REPLAY_STATUS, recording: true, bufferedMs: 600, clips: [clip] };
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => ({ ok: true, json: async () => url.includes("/replay?") ? clip : null })));
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
+      rpc: { timeline: () => [], replayState: () => replay,
+        state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] }, replay: { "AAAA-2": replay },
+          attached: ["AAAA-2"], sessions: [{ udid: "AAAA-2", port: 1, startedAt: 1 }] }),
+      }, context: { projectId: "p", threadId: "thr_1" },
+    });
+    await slot.findByRole("application");
+    fireEvent.click(slot.getByRole("button", { name: "Replay", exact: true }));
+    const canvas = await slot.findByLabelText("Saved simulator replay");
+    await waitFor(() => expect(slot.queryByRole("application")).toBeNull());
+    expect((slot.getByRole("button", { name: "Home (⌘⇧H)" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((slot.getByRole("button", { name: "Save screenshot (⌘S)" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.keyDown(canvas, { key: "a" });
+    fireEvent.paste(canvas, { clipboardData: { getData: () => "do not type into live device" } });
+    expect(send).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalled();
+    fireEvent.click(slot.getByRole("button", { name: "Live", exact: true }));
+    const live = await slot.findByRole("application");
+    expect(live.getAttribute("aria-disabled")).toBe("false");
+    await waitFor(() => expect(player.dispose).toHaveBeenCalledTimes(1));
+    slot.lifecycle.unmount();
+  });
+
+  it("does not offer handoff or poll replay for a device this thread has not attached", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    vi.stubGlobal("WebSocket", class { close() {} });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => null })));
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
+      rpc: { timeline: () => [], replayState: () => REPLAY_STATUS,
+        state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] }, attached: ["AAAA-2"],
+          sessions: [{ udid: "AAAA-2", port: 1, startedAt: 1 }, { udid: "AAAA-1", port: 2, startedAt: 1 }] }),
+      }, context: { projectId: "p", threadId: "thr_1" },
+    });
+    const select = await slot.findByRole("combobox", { name: "Simulator device" });
+    fireEvent.change(select, { target: { value: "AAAA-1" } });
+    await slot.findByRole("button", { name: "Attach", exact: true });
+    expect(slot.queryByRole("button", { name: "Take control" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "Let agent drive" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "Save last 30s" })).toBeNull();
+    expect((slot.getByRole("button", { name: "Home (⌘⇧H)" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(slot.inspection.rpcCalls.filter((call) => ["timeline", "replayState", "control"].includes(call.method))
+      .some((call) => (call.input as { udid?: string }).udid === "AAAA-1")).toBe(false);
     slot.lifecycle.unmount();
   });
 
@@ -242,7 +353,7 @@ describe("iOS Simulator app", () => {
     const pending = new Promise<{ ok: true }>((resolve) => { finish = resolve; });
     const app = await loadPluginApp(() => import("./app"));
     const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
-      rpc: {
+      rpc: { timeline: () => [], replayState: () => REPLAY_STATUS,
         state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] },
           attached: ["AAAA-2"], sessions: [{ udid: "AAAA-2", port: 1234, startedAt: 1 }] }),
         button: () => pending,
@@ -267,7 +378,7 @@ describe("iOS Simulator app", () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => null })));
     const app = await loadPluginApp(() => import("./app"));
     const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
-      rpc: {
+      rpc: { timeline: () => [], replayState: () => REPLAY_STATUS,
         state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] },
           attached: ["AAAA-2"], sessions: [{ udid: "AAAA-2", port: 1234, startedAt: 1 }] }),
         rotate: () => ({ ok: true }),
@@ -279,8 +390,8 @@ describe("iOS Simulator app", () => {
     await waitFor(() => expect((rotate as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(rotate);
     await waitFor(() => expect(slot.inspection.rpcCalls.filter((call) => call.method === "rotate")).toEqual([
-      { method: "rotate", input: { udid: "AAAA-2", orientation: "landscape_right" } },
-      { method: "rotate", input: { udid: "AAAA-2", orientation: "portrait_upside_down" } },
+      { method: "rotate", input: { threadId: "thr_1", udid: "AAAA-2", orientation: "landscape_right" } },
+      { method: "rotate", input: { threadId: "thr_1", udid: "AAAA-2", orientation: "portrait_upside_down" } },
     ]));
     slot.lifecycle.unmount();
   });

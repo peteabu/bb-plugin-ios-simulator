@@ -5,6 +5,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   HARDWARE_BUTTONS,
   HID,
@@ -45,6 +46,7 @@ export interface SimulatorServiceOptions {
   publish(channel: string, payload: unknown): void;
   idleShutdownMs(): Promise<number>;
   screenshotMaxDimension(): Promise<number>;
+  deviceAvailableTo?(threadId: string, udid: string): boolean;
   tmpDir?: string;
 }
 
@@ -78,8 +80,8 @@ export const CHANNELS = {
   activity: "agent-activity",
 } as const;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return delay(ms, undefined, { signal });
 }
 
 export class SimulatorService {
@@ -87,7 +89,9 @@ export class SimulatorService {
   private readonly bootedByPlugin = new Set<string>();
   private readonly idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly textOperations = new Map<string, Promise<void>>();
+  private consentOperation: Promise<void> = Promise.resolve();
   private readonly loaded: Promise<void>;
+  private readonly lifetime = new AbortController();
   private disposed = false;
 
   constructor(private readonly options: SimulatorServiceOptions) {
@@ -181,7 +185,9 @@ export class SimulatorService {
         if (attached) return attached;
       }
     }
-    const booted = devices.filter((device) => isBooted(device));
+    const available = threadId && this.options.deviceAvailableTo
+      ? devices.filter((device) => this.options.deviceAvailableTo!(threadId, device.udid)) : devices;
+    const booted = available.filter((device) => isBooted(device));
     if (booted.length === 1) return booted[0]!;
     if (booted.length > 1) {
       throw new SimulatorError(
@@ -189,7 +195,7 @@ export class SimulatorService {
       );
     }
     if (options.allowDefault) {
-      const fallback = pickDefaultDevice(devices);
+      const fallback = pickDefaultDevice(available);
       if (fallback) return fallback;
     }
     throw new SimulatorError(
@@ -203,17 +209,22 @@ export class SimulatorService {
     query: string | null | undefined,
     options: { allowDefault?: boolean; select?: boolean; signal?: AbortSignal } = {},
   ): Promise<AttachResult> {
-    const device = await this.resolveDevice(threadId, query, options);
+    const signal = options.signal ? AbortSignal.any([this.lifetime.signal, options.signal]) : this.lifetime.signal;
+    signal.throwIfAborted();
+    const device = await this.resolveDevice(threadId, query, { ...options, signal });
+    signal.throwIfAborted();
     let booted = false;
     if (!isBooted(device)) {
       this.options.log.info(`booting ${device.name} (${device.udid})`);
-      await this.options.simctl.boot(device.udid, options.signal);
+      await this.options.simctl.boot(device.udid, signal);
+      signal.throwIfAborted();
       this.bootedByPlugin.add(device.udid);
       booted = true;
       device.state = "Booted";
     }
     this.cancelIdleShutdown(device.udid);
-    const session = await this.options.streams.ensure(device.udid, options.signal);
+    const session = await this.options.streams.ensure(device.udid, signal);
+    signal.throwIfAborted();
     const set = this.attachments.get(threadId) ?? new Set<string>();
     const isNew = !set.has(device.udid);
     set.add(device.udid);
@@ -221,6 +232,7 @@ export class SimulatorService {
     // Keeping that device first reuses the persisted attachment order.
     this.attachments.set(threadId, options.select ? new Set([device.udid, ...set]) : set);
     await this.persist();
+    signal.throwIfAborted();
     if (isNew || booted || options.select) {
       this.options.publish(CHANNELS.attached, { threadId, udid: device.udid, name: device.name });
     }
@@ -232,17 +244,24 @@ export class SimulatorService {
   async detach(
     threadId: string,
     udid: string,
-    options: { shutdown?: boolean } = {},
+    options: { shutdown?: boolean; signal?: AbortSignal } = {},
   ): Promise<void> {
     await this.loaded;
+    options.signal?.throwIfAborted();
     const set = this.attachments.get(threadId);
     set?.delete(udid);
     if (set && set.size === 0) this.attachments.delete(threadId);
-    await this.persist();
+    try { await this.persist(); }
+    finally {
+      // Removing the last attachment must not leave a recorder/helper alive
+      // when cancellation interrupts the optional physical shutdown.
+      if (this.threadsFor(udid).length === 0) await this.options.streams.stop(udid);
+      this.options.publish(CHANNELS.sessions, { udid });
+    }
+    options.signal?.throwIfAborted();
     if (this.threadsFor(udid).length === 0) {
-      await this.options.streams.stop(udid);
       if (options.shutdown) {
-        await this.shutdownDevice(udid);
+        await this.shutdownDevice(udid, options.signal);
       } else if (this.bootedByPlugin.has(udid)) {
         await this.scheduleIdleShutdown(udid);
       }
@@ -250,11 +269,13 @@ export class SimulatorService {
     this.options.publish(CHANNELS.sessions, { udid });
   }
 
-  async shutdownDevice(udid: string): Promise<void> {
+  async shutdownDevice(udid: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     this.cancelIdleShutdown(udid);
     await this.options.streams.stop(udid);
     try {
-      await this.options.simctl.shutdown(udid);
+      signal?.throwIfAborted();
+      await this.options.simctl.shutdown(udid, signal);
     } finally {
       this.bootedByPlugin.delete(udid);
       await this.persist();
@@ -348,12 +369,13 @@ export class SimulatorService {
     return formatAxSnapshot(await this.accessibility(udid, options.signal), options);
   }
 
-  async tap(udid: string, x: number, y: number, holdMs = 60): Promise<void> {
+  async tap(udid: string, x: number, y: number, holdMs = 60, signal?: AbortSignal): Promise<void> {
     await this.options.streams.withHid(udid, async (hid) => {
+      signal?.throwIfAborted();
       hid.send(HID.TOUCH, { type: "begin", x, y });
-      await sleep(holdMs);
-      hid.send(HID.TOUCH, { type: "end", x, y });
-    });
+      try { await sleep(holdMs, signal); }
+      finally { hid.send(HID.TOUCH, { type: "end", x, y }); }
+    }, signal);
   }
 
   async swipe(
@@ -361,22 +383,23 @@ export class SimulatorService {
     from: { x: number; y: number },
     to: { x: number; y: number },
     durationMs = 300,
+    signal?: AbortSignal,
   ): Promise<void> {
     const steps = Math.max(4, Math.min(40, Math.round(durationMs / 16)));
     await this.options.streams.withHid(udid, async (hid) => {
-      hid.send(HID.TOUCH, { type: "begin", x: from.x, y: from.y });
-      for (let step = 1; step <= steps; step++) {
-        await sleep(durationMs / steps);
-        const t = step / steps;
-        hid.send(HID.TOUCH, {
-          type: "move",
-          x: from.x + (to.x - from.x) * t,
-          y: from.y + (to.y - from.y) * t,
-        });
-      }
-      await sleep(20);
-      hid.send(HID.TOUCH, { type: "end", x: to.x, y: to.y });
-    });
+      signal?.throwIfAborted();
+      let last = from;
+      hid.send(HID.TOUCH, { type: "begin", ...from });
+      try {
+        for (let step = 1; step <= steps; step++) {
+          await sleep(durationMs / steps, signal);
+          const t = step / steps;
+          last = { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t };
+          hid.send(HID.TOUCH, { type: "move", ...last });
+        }
+        await sleep(20, signal);
+      } finally { hid.send(HID.TOUCH, { type: "end", ...last }); }
+    }, signal);
   }
 
   private async serializeText(udid: string, work: () => Promise<void>): Promise<void> {
@@ -403,14 +426,14 @@ export class SimulatorService {
       hid.send(HID.KEY, { type: "down", usage: 227 });
       try {
         hid.send(HID.KEY, { type: "down", usage: 25 });
-        await sleep(40);
+        await sleep(40, signal);
       } finally {
         for (const usage of [25, 227]) {
           try { hid.send(HID.KEY, { type: "up", usage }); } catch { /* Release remaining keys even if the socket closed. */ }
         }
       }
-      await sleep(100);
-    });
+      await sleep(100, signal);
+    }, signal);
   }
 
   typeText(udid: string, text: string, method: "paste" | "keys" = "paste", signal?: AbortSignal): Promise<void> {
@@ -442,14 +465,14 @@ export class SimulatorService {
           hid.send(HID.KEY, event);
           if (event.type === "down") held.add(event.usage);
           else held.delete(event.usage);
-          await sleep(4);
+          await sleep(4, signal);
         }
       } finally {
         for (const usage of held) {
           try { hid.send(HID.KEY, { type: "up", usage }); } catch { /* Connection already closed. */ }
         }
       }
-    });
+    }, signal);
   }
 
   async pressButton(udid: string, button: HardwareButton, signal?: AbortSignal): Promise<void> {
@@ -541,8 +564,11 @@ export class SimulatorService {
     const hadStream = this.options.streams.get(udid) !== null;
     if (hadStream) {
       await this.options.streams.stop(udid);
-      await sleep(2_500);
-      await this.options.streams.ensure(udid, signal);
+      // A handoff can abort the wait; always restore capture for the new owner.
+      try { await sleep(2_500, signal); }
+      finally {
+        if (!this.disposed && this.threadsFor(udid).length > 0) await this.options.streams.ensure(udid, this.lifetime.signal);
+      }
     }
     this.options.publish(CHANNELS.sessions, { udid });
     return { repaired: true };
@@ -551,22 +577,29 @@ export class SimulatorService {
   /** After a plugin reload, bring back streams for devices threads still hold and that are booted. */
   async restoreSessions(): Promise<void> {
     await this.loaded;
+    const signal = this.lifetime.signal;
+    if (signal.aborted) return;
     const wanted = new Set([...this.attachments.values()].flatMap((udids) => [...udids]));
     if (wanted.size === 0) return;
     let devices: SimDevice[];
     try {
-      devices = await this.devices();
+      devices = await this.devices(signal);
     } catch (error) {
+      if (signal.aborted) return;
       this.options.log.warn(`could not list simulators to restore streams: ${describe(error)}`);
       return;
     }
+    if (signal.aborted) return;
     for (const udid of wanted) {
+      if (signal.aborted) return;
       const device = devices.find((entry) => entry.udid === udid);
       if (!device || !isBooted(device)) continue;
       try {
-        await this.options.streams.ensure(udid);
+        await this.options.streams.ensure(udid, signal);
+        if (signal.aborted) return;
         this.options.log.info(`restored stream for ${device.name}`);
       } catch (error) {
+        if (signal.aborted) return;
         this.options.log.warn(`could not restore stream for ${device.name}: ${describe(error)}`);
       }
     }
@@ -574,13 +607,18 @@ export class SimulatorService {
   }
 
   async consent(): Promise<Record<string, boolean>> {
+    await this.consentOperation;
     return (await this.options.kv.get<Record<string, boolean>>(KV_CONSENT)) ?? {};
   }
 
   async setConsent(udid: string, allow: boolean): Promise<void> {
-    const current = await this.consent();
-    current[udid] = allow;
-    await this.options.kv.set(KV_CONSENT, current);
+    const pending = this.consentOperation.catch(() => undefined).then(async () => {
+      const current = (await this.options.kv.get<Record<string, boolean>>(KV_CONSENT)) ?? {};
+      current[udid] = allow;
+      await this.options.kv.set(KV_CONSENT, current);
+    });
+    this.consentOperation = pending;
+    await pending;
     this.options.publish(CHANNELS.sessions, { udid });
   }
 
@@ -590,6 +628,7 @@ export class SimulatorService {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.lifetime.abort(new SimulatorError("The simulator service has stopped."));
     for (const timer of this.idleTimers.values()) clearTimeout(timer);
     this.idleTimers.clear();
     await this.options.streams.stopAll();

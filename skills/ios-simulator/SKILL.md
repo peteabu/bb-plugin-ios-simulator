@@ -7,7 +7,8 @@ description: Build, run, see, and drive an iOS app in Apple's iOS Simulator from
 
 The iOS Simulator plugin streams a simulator into a panel beside the thread
 and gives you native tools to control the same device. The user sees every
-tap you make, and can tap too.
+tap you make. The panel's Take control / Let agent drive actions hand the
+device between the human and agent; only one thread controls a device.
 
 ## Tools
 
@@ -28,6 +29,8 @@ tap you make, and can tap too.
 | `ios_sim_open_url` | Open a deep link or web page on the device. |
 | `ios_sim_set_appearance` | Switch light and dark mode. |
 | `ios_sim_detach` | Stop streaming; optionally shut the device down. |
+| `ios_sim_session` | Read control ownership, replay readiness and recent input/app diagnostics. |
+| `ios_sim_save_replay` | Capture the available last 30 seconds for playback or JSON download in the panel. |
 
 ## Procedure
 
@@ -62,6 +65,15 @@ tap you make, and can tap too.
 
 - The first time you control a device the user may be asked to allow it. If
   they decline, stop driving the device and ask them to tap through instead.
+- If another thread or the human holds control, do not try to take it through
+  RPC, CLI, or another input path. Use session/read-only tools while working
+  independently; the user can select Let agent drive when ready. Reattaching
+  does not undo a handoff. An explicit panel handoff grants permission too.
+- Replays and their event timelines are bounded in-memory snapshots. They
+  clear on detach/reload; the user can download JSON to keep them. The panel
+  shows collection times; crash reports may arrive after the crash itself.
+- Launch apps through the plugin to follow their PID for app logs and match
+  their crash reports. Missing diagnostics are reported as unavailable.
 - Never sign in to real accounts on a device you drive. Screenshots are sent
   to the model provider with the conversation.
 - Coordinates are normalized: `x` and `y` run from 0 to 1 across the

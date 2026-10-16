@@ -16,6 +16,9 @@ import {
   HARDWARE_BUTTON_NAMES,
   ORIENTATIONS,
   clamp01,
+  HID,
+  decodeHid,
+  screenConfigFrom,
   type HardwareButton,
 } from "./lib/sim-protocol";
 import { centerNormalized, findElement } from "./server/ax";
@@ -35,6 +38,9 @@ import {
 import { installNativePatch, nativePatchStatus } from "./server/native-patch";
 import { registerAndroid } from "./server/android";
 import { registerDeviceBezels } from "./server/device-bezel";
+import { ControlLeases } from "./server/control";
+import { ReplayRecorder } from "./server/replay";
+import type { TimelineEvent } from "./lib/session-types";
 
 export const AGENT_CONTROL_MODES = ["ask", "always", "never"] as const;
 export type AgentControlMode = (typeof AGENT_CONTROL_MODES)[number];
@@ -47,6 +53,20 @@ const deviceSchema = z.object({
   runtimeId: z.string(),
   deviceType: z.string().nullable(),
   isAvailable: z.boolean(),
+});
+
+const controlSchema = z.object({ threadId: z.string(), mode: z.enum(["human", "agent"]), changedAt: z.number() });
+const clipSchema = z.object({
+  id: z.string(), udid: z.string(), threadId: z.string(), createdAt: z.number(),
+  startAt: z.number(), endAt: z.number(), frameCount: z.number(),
+});
+const eventSchema = z.object({
+  id: z.string(), at: z.number(), kind: z.enum(["input", "log", "crash", "control", "lifecycle", "error"]),
+  actor: z.enum(["human", "agent", "system"]), label: z.string(), detail: z.string().optional(), threadId: z.string().optional(),
+});
+const replaySchema = z.object({
+  recording: z.boolean(), bufferedMs: z.number(), bytes: z.number(), error: z.string().nullable(),
+  app: z.string().nullable(), diagnostics: z.string().nullable(), clips: z.array(clipSchema),
 });
 
 const stateSchema = z.object({
@@ -64,6 +84,8 @@ const stateSchema = z.object({
   attached: z.array(z.string()),
   bootedByPlugin: z.array(z.string()),
   consent: z.record(z.string(), z.boolean()),
+  controls: z.record(z.string(), controlSchema),
+  replay: z.record(z.string(), replaySchema),
   /** Devices whose input Xcode's Device Hub currently captures (taps are ignored until repaired). */
   inputShadowed: z.array(z.string()),
   agentControl: z.enum(AGENT_CONTROL_MODES),
@@ -91,28 +113,37 @@ export const rpcContract = defineRpcContract({
     output: ok,
   },
   button: {
-    input: z.object({ udid: z.string(), button: buttonEnum }).strict(),
+    input: z.object({ threadId: z.string(), udid: z.string(), button: buttonEnum }).strict(),
     output: ok,
   },
   rotate: {
-    input: z.object({ udid: z.string(), orientation: orientationEnum }).strict(),
+    input: z.object({ threadId: z.string(), udid: z.string(), orientation: orientationEnum }).strict(),
     output: ok,
   },
   openUrl: {
-    input: z.object({ udid: z.string(), url: z.string().url() }).strict(),
-    output: ok,
-  },
-  setConsent: {
-    input: z.object({ udid: z.string(), allow: z.boolean() }).strict(),
+    input: z.object({ threadId: z.string(), udid: z.string(), url: z.string().url() }).strict(),
     output: ok,
   },
   repairInput: {
-    input: z.object({ udid: z.string() }).strict(),
+    input: z.object({ threadId: z.string(), udid: z.string() }).strict(),
     output: z.object({ repaired: z.boolean() }),
   },
   pasteText: {
-    input: z.object({ udid: z.string(), text: z.string().max(65536) }).strict(),
+    input: z.object({ threadId: z.string(), udid: z.string(), text: z.string().max(65536) }).strict(),
     output: ok,
+  },
+  control: {
+    input: z.object({ threadId: z.string(), udid: z.string(), mode: z.enum(["human", "agent"]) }).strict(),
+    output: controlSchema,
+  },
+  saveReplay: {
+    input: z.object({ threadId: z.string(), udid: z.string() }).strict(), output: clipSchema,
+  },
+  timeline: {
+    input: z.object({ threadId: z.string(), udid: z.string() }).strict(), output: z.array(eventSchema),
+  },
+  replayState: {
+    input: z.object({ threadId: z.string(), udid: z.string() }).strict(), output: replaySchema,
   },
 });
 
@@ -141,6 +172,7 @@ function deviceLine(device: SimDevice, attached: ReadonlySet<string>): string {
 export interface PluginDependencies {
   exec?: Exec;
   streams?: StreamManager;
+  replay?: ReplayRecorder;
 }
 
 export function createPlugin(dependencies: PluginDependencies = {}) {
@@ -207,7 +239,7 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
         log: bb.log,
         node: () => resolveNodeCommand({ override: current.nodePath }),
         serveSim: () => resolveServeSimEntry({ override: current.serveSimPath }),
-        onChange: () => bb.realtime.publish(CHANNELS.sessions, {}),
+        onChange: () => { syncRecorders(); bb.realtime.publish(CHANNELS.sessions, {}); },
         // 0 = automatic: the forced-capture pacer is only needed with the
         // stock serve-sim capture; the patched module polls on its own.
         captureHz: () => (current.captureHz > 0 ? current.captureHz : nativePatched ? 0 : 60),
@@ -218,10 +250,57 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       streams,
       kv: bb.storage.kv,
       log: bb.log,
-      publish: (channel, payload) => bb.realtime.publish(channel, payload),
+      publish: (channel, payload) => { syncRecorders(); bb.realtime.publish(channel, payload); },
       idleShutdownMs: async () => current.idleShutdownMinutes * 60_000,
       screenshotMaxDimension: async () => current.screenshotMaxDimension,
+      deviceAvailableTo: (threadId, udid) => { const owner = controls.state(udid); return !owner || owner.threadId === threadId; },
     });
+    const replay = dependencies.replay ?? new ReplayRecorder();
+    const panelInputs = new Map<string, Set<() => void>>();
+    const controls = new ControlLeases((udid, control) => {
+      for (const release of panelInputs.get(udid) ?? []) release();
+      replay.record(udid, {
+        kind: "control", actor: "system", label: control ? `${control.mode === "human" ? "Human" : "Agent"} took control` : "Control released",
+        ...(control ? { threadId: control.threadId } : {}),
+      });
+      bb.realtime.publish("control-changed", { udid, control });
+    });
+    const recordedDevices = new Set<string>();
+    const endedThreads = new Set<string>();
+    async function attachThread(threadId: string, device: string | null | undefined, options: Parameters<SimulatorService["attach"]>[2]) {
+      if (endedThreads.has(threadId)) throw new SimulatorError("This thread is archived or deleted.");
+      const result = await service.attach(threadId, device, options);
+      if (endedThreads.has(threadId)) {
+        await service.detach(threadId, result.device.udid, { shutdown: result.booted });
+        throw new SimulatorError("The thread closed while its simulator was attaching.");
+      }
+      return result;
+    }
+    function syncRecorders() {
+      const live = new Set(service.sessions().map((session) => session.udid));
+      for (const udid of live) {
+        if (!recordedDevices.has(udid)) {
+          recordedDevices.add(udid);
+          replay.ensure(udid, streams.helperUrl(udid, "/stream.avcc"), streams.helperUrl(udid, "/config"));
+        }
+      }
+      for (const udid of recordedDevices) {
+        if (!live.has(udid)) { replay.stop(udid); recordedDevices.delete(udid); }
+      }
+    }
+    function assertAttached(threadId: string, udid: string) {
+      if (!service.attachedTo(threadId).includes(udid)) throw new SimulatorError("Attach this simulator to this thread first.");
+    }
+    function event(udid: string, actor: "human" | "agent", threadId: string, label: string, kind: TimelineEvent["kind"] = "input") {
+      replay.record(udid, { actor, threadId, label, kind });
+    }
+    async function human<T>(threadId: string, udid: string, label: string, work: (signal: AbortSignal) => Promise<T>) {
+      assertAttached(threadId, udid);
+      const operation = controls.begin(udid, threadId, "human");
+      try { const result = await work(operation.signal); operation.signal.throwIfAborted(); event(udid, "human", threadId, label); return result; }
+      catch (error) { event(udid, "human", threadId, `${label}: ${describe(error)}`, "error"); throw error; }
+      finally { operation.release(); }
+    }
     registerAndroid(bb, { agentControl: () => normalizeAgentControl(current.agentControl) });
     registerDeviceBezels(bb, { exec, simctl });
 
@@ -284,13 +363,18 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
             : [],
           bootedByPlugin: service.bootedDevices(),
           consent: await service.consent(),
+          controls: Object.fromEntries([...sessionUdids].flatMap((udid) => {
+            const state = controls.state(udid); return state ? [[udid, state]] : [];
+          })),
+          replay: Object.fromEntries([...sessionUdids].map((udid) => [udid, replay.status(udid, threadId ?? "")])),
           inputShadowed,
           agentControl: normalizeAgentControl(current.agentControl),
           error,
         };
       },
       async attach({ threadId, device }) {
-        const result = await service.attach(threadId, device, { allowDefault: true, select: true });
+        const result = await attachThread(threadId, device, { allowDefault: true, select: true });
+        controls.ensure(result.device.udid, threadId, "human");
         return {
           udid: result.device.udid,
           port: result.session.port,
@@ -298,33 +382,62 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
         };
       },
       async detach({ threadId, udid, shutdown }) {
-        await service.detach(threadId, udid, { shutdown });
+        const operation = shutdown ? controls.begin(udid, threadId, "human") : null;
+        try {
+          await service.detach(threadId, udid, { shutdown, signal: operation?.signal });
+          operation?.signal.throwIfAborted();
+        } finally {
+          if (!service.attachedTo(threadId).includes(udid)) controls.release(udid, threadId);
+          operation?.release();
+        }
         return { ok: true as const };
       },
-      async button({ udid, button }) {
-        await service.pressButton(udid, button);
+      async button({ threadId, udid, button }) {
+        await human(threadId, udid, `Pressed ${button}`, (signal) => service.pressButton(udid, button, signal));
         return { ok: true as const };
       },
-      async rotate({ udid, orientation }) {
-        await service.rotate(udid, orientation);
+      async rotate({ threadId, udid, orientation }) {
+        await human(threadId, udid, `Rotated to ${orientation}`, (signal) => service.rotate(udid, orientation, signal));
         return { ok: true as const };
       },
-      async openUrl({ udid, url }) {
-        await service.openUrl(udid, url);
+      async openUrl({ threadId, udid, url }) {
+        await human(threadId, udid, "Opened URL", (signal) => service.openUrl(udid, url, signal));
         return { ok: true as const };
       },
-      async setConsent({ udid, allow }) {
-        await service.setConsent(udid, allow);
-        return { ok: true as const };
+      async repairInput({ threadId, udid }) {
+        return human(threadId, udid, "Repaired input", (signal) => service.repairInput(udid, signal));
       },
-      async repairInput({ udid }) {
-        return service.repairInput(udid);
-      },
-      async pasteText({ udid, text }) {
+      async pasteText({ threadId, udid, text }) {
         if (!streams.get(udid)) throw new SimulatorError("Attach the simulator before pasting.");
         if (await service.inputShadowed(udid)) throw new SimulatorError("Device Hub captures input. Close its device window and repair input before pasting.");
-        await service.pasteText(udid, text);
+        await human(threadId, udid, `Pasted ${text.length} characters`, (signal) => service.pasteText(udid, text, signal));
         return { ok: true as const };
+      },
+      async control({ threadId, udid, mode }) {
+        await service.ready();
+        assertAttached(threadId, udid);
+        if (mode === "agent" && normalizeAgentControl(current.agentControl) === "never") {
+          throw new SimulatorError("Agent control is turned off in the plugin settings.");
+        }
+        // This explicit human action grants permission as well as the lease.
+        const grant = mode === "agent" ? service.setConsent(udid, true) : null;
+        const next = controls.set(udid, threadId, mode);
+        await grant;
+        return controls.state(udid) ?? next;
+      },
+      async saveReplay({ threadId, udid }) {
+        assertAttached(threadId, udid);
+        const clip = replay.save(udid, threadId);
+        bb.realtime.publish("replay-changed", { udid });
+        return clip;
+      },
+      async timeline({ threadId, udid }) {
+        assertAttached(threadId, udid);
+        return replay.events(udid).filter((entry) => !entry.threadId || entry.threadId === threadId).slice(-200);
+      },
+      async replayState({ threadId, udid }) {
+        assertAttached(threadId, udid);
+        return replay.status(udid, threadId);
       },
     });
 
@@ -387,13 +500,43 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       }
     });
 
+    bb.http.route("GET", "/replay", async (c) => {
+      const udid = c.req.query("udid") ?? "";
+      const threadId = c.req.query("threadId") ?? "";
+      const id = c.req.query("id") ?? "";
+      if (!service.attachedTo(threadId).includes(udid)) return c.json({ error: "Simulator is not attached to this thread." }, 403);
+      const clip = replay.clip(udid, id, threadId);
+      if (!clip) return c.json({ error: "Replay expired or belongs to another thread." }, 404);
+      const headers: Record<string, string> = { "content-type": "application/json", "cache-control": "no-store" };
+      if (c.req.query("download") === "1") headers["content-disposition"] = `attachment; filename="simulator-replay-${clip.createdAt}.json"`;
+      return new Response(JSON.stringify(clip), { headers });
+    });
+
     bb.http.experimental_websocket("/hid", ({ url }) => {
       const udid = url.searchParams.get("udid") ?? "";
+      const threadId = url.searchParams.get("threadId") ?? "";
       let upstream: Awaited<ReturnType<StreamManager["openHid"]>> | null = null;
       let closed = false;
-      const pending: Uint8Array[] = [];
+      let invalidate = () => {};
+      let touching: { x: number; y: number } | null = null;
+      const keys = new Set<number>();
+      const releaseInput = () => {
+        if (touching) { try { upstream?.send(HID.TOUCH, { type: "end", ...touching }); } catch {} touching = null; }
+        for (const usage of keys) { try { upstream?.send(HID.KEY, { type: "up", usage }); } catch {} }
+        keys.clear();
+      };
       return {
         async onOpen(socket) {
+          invalidate = () => {
+            closed = true;
+            releaseInput();
+            panelInputs.get(udid)?.delete(invalidate);
+            upstream?.close();
+            socket.close(1000, "Control changed");
+          };
+          const releases = panelInputs.get(udid) ?? new Set<() => void>();
+          releases.add(invalidate);
+          panelInputs.set(udid, releases);
           try {
             const connection = await streams.openHid(udid);
             if (closed) {
@@ -401,28 +544,52 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
               return;
             }
             upstream = connection;
-            connection.onMessage((data) => socket.send(data));
+            connection.onMessage((data) => {
+              const message = decodeHid(data);
+              const config = message && screenConfigFrom(message.payload);
+              if (config) replay.setConfig(udid, config);
+              socket.send(data);
+            });
             connection.onClose(() => socket.close(1011, "simulator input socket closed"));
-            for (const frame of pending) connection.sendRaw(frame);
-            pending.length = 0;
           } catch (error) {
+            closed = true;
+            panelInputs.get(udid)?.delete(invalidate);
+            upstream?.close();
             socket.close(1011, describe(error).slice(0, 120));
           }
         },
         onMessage(socket, data) {
+          if (closed) return;
           const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
           if (upstream) {
-            try { upstream.sendRaw(bytes); }
+            try {
+              assertAttached(threadId, udid);
+              controls.assert(udid, threadId, "human");
+              const message = decodeHid(bytes);
+              if (!message) return;
+              const payload = message.payload as Record<string, unknown> | null;
+              if (message.opcode === HID.TOUCH && payload && typeof payload.x === "number" && typeof payload.y === "number") {
+                touching = payload.type === "end" ? null : { x: payload.x, y: payload.y };
+                if (payload.type === "begin" || payload.type === "end") event(udid, "human", threadId, `${payload.type === "begin" ? "Touch" : "Release"} (${payload.x.toFixed(2)}, ${payload.y.toFixed(2)})`);
+              } else if (message.opcode === HID.KEY && payload && typeof payload.usage === "number") {
+                if (payload.type === "down") keys.add(payload.usage); else keys.delete(payload.usage);
+                if (payload.type === "down") event(udid, "human", threadId, "Key pressed");
+              } else if (message.opcode === HID.BUTTON) event(udid, "human", threadId, "Hardware button");
+              upstream.sendRaw(bytes);
+            }
             catch (error) { socket.close(1011, describe(error).slice(0, 120)); }
           }
-          else if (pending.length < 256) pending.push(bytes);
         },
         onClose() {
           closed = true;
+          releaseInput();
+          panelInputs.get(udid)?.delete(invalidate);
           upstream?.close();
         },
         onError() {
           closed = true;
+          releaseInput();
+          panelInputs.get(udid)?.delete(invalidate);
           upstream?.close();
         },
       };
@@ -432,7 +599,7 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
     async function ensureConsent(
       threadId: string,
       device: SimDevice,
-      signal: AbortSignal,
+      signal?: AbortSignal,
     ): Promise<void> {
       const mode = normalizeAgentControl(current.agentControl);
       if (mode === "always") return;
@@ -457,6 +624,8 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
         },
         { signal },
       );
+      signal?.throwIfAborted();
+      if (answer.outcome !== "submitted") throw new SimulatorError("Simulator control request was cancelled. Consent has not changed.");
       const allowed =
         answer.outcome === "submitted" &&
         typeof answer.value === "object" &&
@@ -478,27 +647,37 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
     async function withDevice(
       ctx: ToolCtx,
       query: string | undefined,
-      options: { allowDefault?: boolean; select?: boolean; consent?: boolean; input?: boolean },
-      work: (device: SimDevice, booted: boolean) => Promise<ToolResult>,
+      options: { allowDefault?: boolean; select?: boolean; consent?: boolean; input?: boolean; action?: string },
+      work: (device: SimDevice, booted: boolean, signal: AbortSignal) => Promise<ToolResult>,
     ): Promise<ToolResult> {
       try {
-        const { device, booted } = await service.attach(ctx.threadId, query, {
+        const { device, booted } = await attachThread(ctx.threadId, query, {
           allowDefault: options.allowDefault ?? false,
           select: options.select,
           signal: ctx.signal,
         });
-        if (options.consent !== false) await ensureConsent(ctx.threadId, device, ctx.signal);
-        if (options.input && (await service.inputShadowed(device.udid, ctx.signal))) {
-          throw new SimulatorError(
-            `Xcode's Device Hub has captured input on ${device.name}, so taps and keys would be ignored. Call ios_sim_repair_input (it restarts SpringBoard and closes running apps, so relaunch the app afterwards), or ask the user to close the device's window in Device Hub.`,
-          );
-        }
-        service.agentActivity(device.udid, true);
+        controls.ensure(device.udid, ctx.threadId, "agent");
+        const operation = options.input || options.action ? controls.beginAgent(device.udid, ctx.threadId, ctx.signal) : null;
+        const signal = operation?.signal ?? ctx.signal;
         try {
-          return await work(device, booted);
-        } finally {
-          service.agentActivity(device.udid, false);
-        }
+          if (options.consent !== false) await ensureConsent(ctx.threadId, device, signal);
+          if (options.input && (await service.inputShadowed(device.udid, signal))) {
+            throw new SimulatorError(
+              `Xcode's Device Hub has captured input on ${device.name}, so taps and keys would be ignored. Call ios_sim_repair_input (it restarts SpringBoard and closes running apps, so relaunch the app afterwards), or ask the user to close the device's window in Device Hub.`,
+            );
+          }
+          signal.throwIfAborted();
+          service.agentActivity(device.udid, true);
+          try {
+            if (options.input || options.action) event(device.udid, "agent", ctx.threadId, options.action ?? "Input");
+            return await work(device, booted, signal);
+          } catch (error) {
+            event(device.udid, "agent", ctx.threadId, describe(error), "error");
+            throw error;
+          } finally {
+            service.agentActivity(device.udid, false);
+          }
+        } finally { operation?.release(); }
       } catch (error) {
         return toolError(error);
       }
@@ -542,18 +721,21 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       description:
         "Boot an iOS simulator if needed, start streaming it into the iOS Simulator panel beside this thread, and make it this thread's device. Call it before building when the task is about running, seeing, or testing an iOS app.",
       instructions:
-        "When the user wants to run, see, or test an iOS app, use the ios_sim_* tools: ios_sim_attach first, build with xcodebuild for `-destination 'platform=iOS Simulator,id=<udid>'`, then ios_sim_install_and_launch, then ios_sim_screenshot or ios_sim_describe_ui to verify what you built. The user watches the same device live and may tap it too.",
+        "When the user wants to run, see, or test an iOS app, use the ios_sim_* tools: ios_sim_attach first, build with xcodebuild for `-destination 'platform=iOS Simulator,id=<udid>'`, then ios_sim_install_and_launch, then ios_sim_screenshot or ios_sim_describe_ui to verify what you built. The user watches the same device live. Take control / Let agent drive in the panel hands the device between human and agent; respect human control and other threads' ownership. Use ios_sim_session for recent input/app diagnostics and ios_sim_save_replay to capture the available last 30 seconds.",
       presentation: { label: { pending: "Attaching simulator", completed: "Attached simulator" } },
       parameters: z.object({ device: deviceParam }),
       async execute({ device }, ctx) {
-        return withDevice(ctx, device, { allowDefault: true, select: true, consent: false }, async (dev, booted) => {
+        return withDevice(ctx, device, { allowDefault: true, select: true, consent: false }, async (dev, booted, signal) => {
           const config = await streams.screenConfig(dev.udid).catch(() => null);
-          const shadowed = await service.inputShadowed(dev.udid, ctx.signal).catch(() => false);
+          const shadowed = await service.inputShadowed(dev.udid, signal).catch(() => false);
+          const controller = controls.state(dev.udid);
           return [
             shadowed
               ? "Note: Xcode's Device Hub currently captures this device's input; taps will be ignored until ios_sim_repair_input runs (that closes running apps) or the user closes the device window in Device Hub."
               : "",
             `${booted ? "Booted and attached" : "Attached"} ${dev.name} (${dev.runtime}) — udid ${dev.udid}. The iOS Simulator panel shows it live.`,
+            controller && (controller.threadId !== ctx.threadId || controller.mode !== "agent")
+              ? "Observation only: another thread or the human controls this device. Respect the handoff; the user can return agent control in the panel." : "Agent control is assigned to this thread.",
             config
               ? `Screen: ${config.width}x${config.height} points, ${config.orientation ?? "portrait"}.`
               : "",
@@ -573,8 +755,8 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       presentation: { label: { pending: "Taking a screenshot", completed: "Took a screenshot" } },
       parameters: z.object({ device: deviceParam }),
       async execute({ device }, ctx) {
-        return withDevice(ctx, device, {}, async (dev) => {
-          const shot = await service.screenshot(dev.udid, ctx.signal);
+        return withDevice(ctx, device, {}, async (dev, _booted, signal) => {
+          const shot = await service.screenshot(dev.udid, signal);
           const config = await streams.screenConfig(dev.udid).catch(() => null);
           return {
             content: [
@@ -603,8 +785,8 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
         limit: z.number().int().min(1).max(500).optional().describe("Max elements (default 120)."),
       }),
       async execute({ device, filter, limit }, ctx) {
-        return withDevice(ctx, device, {}, (dev) =>
-          service.describeUi(dev.udid, { filter, limit, signal: ctx.signal }),
+        return withDevice(ctx, device, {}, (dev, _booted, signal) =>
+          service.describeUi(dev.udid, { filter, limit, signal }),
         );
       },
     });
@@ -622,9 +804,9 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
         holdMs: z.number().int().min(20).max(5000).optional(),
       }),
       async execute({ device, element, x, y, holdMs }, ctx) {
-        return withDevice(ctx, device, { input: true }, async (dev) => {
+        return withDevice(ctx, device, { input: true, action: "Tap" }, async (dev, _booted, signal) => {
           if (element) {
-            const snapshot = await service.accessibility(dev.udid, ctx.signal);
+            const snapshot = await service.accessibility(dev.udid, signal);
             const match = findElement(snapshot, element);
             if (!match) {
               const labels = snapshot.elements
@@ -636,13 +818,13 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
               );
             }
             const center = centerNormalized(match, snapshot.screen);
-            await service.tap(dev.udid, center.x, center.y, holdMs);
+            await service.tap(dev.udid, center.x, center.y, holdMs, signal);
             return `Tapped "${match.label || match.value || match.id}" (${match.role || match.type}) at (${center.x.toFixed(3)}, ${center.y.toFixed(3)}).`;
           }
           if (x === undefined || y === undefined) {
             throw new SimulatorError("Pass either `element` or both `x` and `y` (normalized 0..1).");
           }
-          await service.tap(dev.udid, clamp01(x), clamp01(y), holdMs);
+          await service.tap(dev.udid, clamp01(x), clamp01(y), holdMs, signal);
           return `Tapped (${x.toFixed(3)}, ${y.toFixed(3)}).`;
         });
       },
@@ -663,7 +845,7 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
         durationMs: z.number().int().min(50).max(5000).optional(),
       }),
       async execute({ device, direction, fromX, fromY, toX, toY, durationMs }, ctx) {
-        return withDevice(ctx, device, { input: true }, async (dev) => {
+        return withDevice(ctx, device, { input: true, action: "Swipe" }, async (dev, _booted, signal) => {
           let from = { x: fromX ?? NaN, y: fromY ?? NaN };
           let to = { x: toX ?? NaN, y: toY ?? NaN };
           if (direction) {
@@ -678,7 +860,7 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
           if ([from.x, from.y, to.x, to.y].some((value) => Number.isNaN(value))) {
             throw new SimulatorError("Pass a `direction` or all of fromX, fromY, toX, toY.");
           }
-          await service.swipe(dev.udid, from, to, durationMs);
+          await service.swipe(dev.udid, from, to, durationMs, signal);
           return `Swiped from (${from.x.toFixed(2)}, ${from.y.toFixed(2)}) to (${to.x.toFixed(2)}, ${to.y.toFixed(2)}).`;
         });
       },
@@ -691,8 +873,8 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       presentation: { label: { pending: "Typing", completed: "Typed" } },
       parameters: z.object({ device: deviceParam, text: z.string().min(1).max(4000), method: z.enum(["paste", "keys"]).optional() }),
       async execute({ device, text, method }, ctx) {
-        return withDevice(ctx, device, { input: true }, async (dev) => {
-          await service.typeText(dev.udid, text, method, ctx.signal);
+        return withDevice(ctx, device, { input: true, action: `Typed ${text.length} characters` }, async (dev, _booted, signal) => {
+          await service.typeText(dev.udid, text, method, signal);
           return `Typed ${text.length} character${text.length === 1 ? "" : "s"}.`;
         });
       },
@@ -704,8 +886,8 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       presentation: { label: { pending: "Pasting text", completed: "Pasted text" } },
       parameters: z.object({ device: deviceParam, text: z.string().min(1).max(65536) }),
       async execute({ device, text }, ctx) {
-        return withDevice(ctx, device, { input: true }, async (dev) => {
-          await service.pasteText(dev.udid, text, ctx.signal);
+        return withDevice(ctx, device, { input: true, action: `Pasted ${text.length} characters` }, async (dev, _booted, signal) => {
+          await service.pasteText(dev.udid, text, signal);
           return `Pasted ${text.length} characters. Use ios_sim_screenshot to verify the field.`;
         });
       },
@@ -718,8 +900,8 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       presentation: { label: { pending: "Pressing a button", completed: "Pressed a button" } },
       parameters: z.object({ device: deviceParam, button: buttonEnum }),
       async execute({ device, button }, ctx) {
-        return withDevice(ctx, device, { input: true }, async (dev) => {
-          await service.pressButton(dev.udid, button, ctx.signal);
+        return withDevice(ctx, device, { input: true, action: `Pressed ${button}` }, async (dev, _booted, signal) => {
+          await service.pressButton(dev.udid, button, signal);
           return `Pressed ${button}.`;
         });
       },
@@ -731,8 +913,8 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       presentation: { label: { pending: "Rotating", completed: "Rotated" } },
       parameters: z.object({ device: deviceParam, orientation: orientationEnum }),
       async execute({ device, orientation }, ctx) {
-        return withDevice(ctx, device, {}, async (dev) => {
-          await service.rotate(dev.udid, orientation, ctx.signal);
+        return withDevice(ctx, device, { action: "Rotate" }, async (dev, _booted, signal) => {
+          await service.rotate(dev.udid, orientation, signal);
           return `Rotated to ${orientation}.`;
         });
       },
@@ -750,12 +932,13 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
         launchArgs: z.array(z.string()).optional(),
       }),
       async execute({ device, appPath, bundleId, launchArgs }, ctx) {
-        return withDevice(ctx, device, {}, async (dev) => {
+        return withDevice(ctx, device, { action: "Install and launch app" }, async (dev, _booted, signal) => {
           const result = await service.installAndLaunch(dev.udid, appPath, {
             bundleId,
             launchArgs,
-            signal: ctx.signal,
+            signal,
           });
+          replay.watchApp(dev.udid, result.bundleId, result.output);
           return `Installed and launched ${result.bundleId} on ${dev.name}${result.output ? ` (${result.output})` : ""}. Take ios_sim_screenshot to verify.`;
         });
       },
@@ -772,12 +955,13 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
         terminateFirst: z.boolean().optional().describe("Default true: quit a running instance first."),
       }),
       async execute({ device, bundleId, launchArgs, terminateFirst }, ctx) {
-        return withDevice(ctx, device, {}, async (dev) => {
+        return withDevice(ctx, device, { action: "Launch app" }, async (dev, _booted, signal) => {
           const output = await service.launch(dev.udid, bundleId, {
             launchArgs,
             terminateFirst,
-            signal: ctx.signal,
+            signal,
           });
+          replay.watchApp(dev.udid, bundleId, output);
           return `Launched ${bundleId}${output ? ` (${output})` : ""}.`;
         });
       },
@@ -789,8 +973,8 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       presentation: { label: { pending: "Opening URL", completed: "Opened URL" } },
       parameters: z.object({ device: deviceParam, url: z.string().min(1) }),
       async execute({ device, url }, ctx) {
-        return withDevice(ctx, device, {}, async (dev) => {
-          await service.openUrl(dev.udid, url, ctx.signal);
+        return withDevice(ctx, device, { action: "Open URL" }, async (dev, _booted, signal) => {
+          await service.openUrl(dev.udid, url, signal);
           return `Opened ${url}.`;
         });
       },
@@ -802,8 +986,8 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       presentation: { label: { pending: "Setting appearance", completed: "Set appearance" } },
       parameters: z.object({ device: deviceParam, appearance: z.enum(["light", "dark"]) }),
       async execute({ device, appearance }, ctx) {
-        return withDevice(ctx, device, {}, async (dev) => {
-          await service.setAppearance(dev.udid, appearance, ctx.signal);
+        return withDevice(ctx, device, { action: "Set appearance" }, async (dev, _booted, signal) => {
+          await service.setAppearance(dev.udid, appearance, signal);
           return `Appearance set to ${appearance}.`;
         });
       },
@@ -816,11 +1000,36 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       presentation: { label: { pending: "Repairing simulator input", completed: "Repaired simulator input" } },
       parameters: z.object({ device: deviceParam }),
       async execute({ device }, ctx) {
-        return withDevice(ctx, device, {}, async (dev) => {
-          const { repaired } = await service.repairInput(dev.udid, ctx.signal);
+        return withDevice(ctx, device, { action: "Repair input" }, async (dev, _booted, signal) => {
+          const { repaired } = await service.repairInput(dev.udid, signal);
           return repaired
             ? `Input repaired on ${dev.name}. SpringBoard restarted and running apps were closed; relaunch the app, then continue.`
             : `Input on ${dev.name} was not captured by Device Hub; nothing to repair.`;
+        });
+      },
+    });
+
+    bb.agents.registerTool({
+      name: "ios_sim_session",
+      description: "Read who controls this simulator, replay buffer health, saved replay metadata, and recent input/app diagnostics. Does not take control from a human or another thread.",
+      parameters: z.object({ device: deviceParam }),
+      async execute({ device }, ctx) {
+        return withDevice(ctx, device, { consent: false }, async (dev) => JSON.stringify({
+          control: controls.state(dev.udid), replay: replay.status(dev.udid, ctx.threadId),
+          events: replay.events(dev.udid).filter((entry) => !entry.threadId || entry.threadId === ctx.threadId).slice(-100),
+        }));
+      },
+    });
+
+    bb.agents.registerTool({
+      name: "ios_sim_save_replay",
+      description: "Save the last 30 seconds of the attached iOS video and synchronized input/app diagnostics. The replay stays in bounded memory until detach/reload; view or download it in the Simulator panel.",
+      parameters: z.object({ device: deviceParam }),
+      async execute({ device }, ctx) {
+        return withDevice(ctx, device, { consent: false }, async (dev) => {
+          const clip = replay.save(dev.udid, ctx.threadId);
+          bb.realtime.publish("replay-changed", { udid: dev.udid });
+          return `Replay saved. Open Replay in the Simulator panel to view or download it. ${JSON.stringify(clip)}`;
         });
       },
     });
@@ -834,7 +1043,17 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       async execute({ device, shutdown }, ctx) {
         try {
           const dev = await service.resolveDevice(ctx.threadId, device, { signal: ctx.signal });
-          await service.detach(ctx.threadId, dev.udid, { shutdown: shutdown ?? false });
+          const operation = shutdown || controls.state(dev.udid)?.threadId === ctx.threadId
+            ? controls.beginAgent(dev.udid, ctx.threadId, ctx.signal) : null;
+          try {
+            if (shutdown) await ensureConsent(ctx.threadId, dev, operation!.signal);
+            operation?.signal.throwIfAborted();
+            await service.detach(ctx.threadId, dev.udid, { shutdown: shutdown ?? false, signal: operation?.signal ?? ctx.signal });
+            operation?.signal.throwIfAborted();
+          } finally {
+            if (!service.attachedTo(ctx.threadId).includes(dev.udid)) controls.release(dev.udid, ctx.threadId);
+            operation?.release();
+          }
           return `${shutdown ? "Shut down" : "Detached"} ${dev.name}.`;
         } catch (error) {
           return toolError(error);
@@ -844,12 +1063,15 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
 
     // ----- Thread lifecycle -----------------------------------------------
     const release = (threadId: string) => {
+      endedThreads.add(threadId);
+      controls.releaseThread(threadId);
       service.releaseThread(threadId).catch((error) => {
         bb.log.warn(`releasing simulators for ${threadId} failed: ${describe(error)}`);
       });
     };
     bb.events.on("thread.archived", ({ thread }) => release(thread.id));
     bb.events.on("thread.deleted", ({ thread }) => release(thread.id));
+    bb.events.on("thread.unarchived", ({ thread }) => { endedThreads.delete(thread.id); });
 
     // ----- CLI ------------------------------------------------------------
     const threadOption = {
@@ -862,6 +1084,35 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
         name: "ios-simulator",
         summary: "List, attach, and release iOS simulators for BB threads",
         commands: {
+          session: cliCommand({
+            summary: "Read device control, replay status, and recent diagnostics as JSON",
+            positionals: [{ name: "device", description: "Simulator name or udid; defaults to this thread’s device", required: false }],
+            options: { thread: threadOption },
+            async run(input, ctx) {
+              const threadId = input.options.thread ?? ctx.threadId;
+              if (!threadId) throw new PluginCliError("Pass --thread <thread id>.");
+              const device = await service.resolveDevice(threadId, input.positionals.device, { signal: ctx.signal });
+              assertAttached(threadId, device.udid);
+              return { exitCode: 0, stdout: JSON.stringify({
+                control: controls.state(device.udid), replay: replay.status(device.udid, threadId),
+                events: replay.events(device.udid).filter((entry) => !entry.threadId || entry.threadId === threadId).slice(-100),
+              }) };
+            },
+          }),
+          replay: cliCommand({
+            summary: "Save the last 30 seconds for playback in the Simulator panel",
+            positionals: [{ name: "device", description: "Simulator name or udid; defaults to this thread’s device", required: false }],
+            options: { thread: threadOption },
+            async run(input, ctx) {
+              const threadId = input.options.thread ?? ctx.threadId;
+              if (!threadId) throw new PluginCliError("Pass --thread <thread id>.");
+              const device = await service.resolveDevice(threadId, input.positionals.device, { signal: ctx.signal });
+              assertAttached(threadId, device.udid);
+              const clip = replay.save(device.udid, threadId);
+              bb.realtime.publish("replay-changed", { udid: device.udid });
+              return { exitCode: 0, stdout: JSON.stringify(clip) };
+            },
+          }),
           devices: cliCommand({
             summary: "List simulators with runtime, state, and udid",
             options: { json: jsonOption },
@@ -894,11 +1145,12 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
                   hint: "Pass --thread <thread id>.",
                 });
               }
-              const result = await service.attach(threadId, input.positionals.device ?? null, {
+              const result = await attachThread(threadId, input.positionals.device ?? null, {
                 allowDefault: true,
                 select: true,
                 signal: ctx.signal,
               });
+              controls.ensure(result.device.udid, threadId, "agent");
               const summary = { udid: result.device.udid, name: result.device.name, port: result.session.port };
               return {
                 exitCode: 0,
@@ -915,11 +1167,20 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
             ],
             options: { thread: threadOption },
             async run(input, ctx) {
-              const threadId = input.options.thread ?? ctx.threadId ?? null;
+              const threadId = input.options.thread ?? ctx.threadId;
+              if (!threadId) throw new PluginCliError("Attach from a thread before repairing input.");
               const device = await service.resolveDevice(threadId, input.positionals.device ?? null, {
                 signal: ctx.signal,
               });
-              const { repaired } = await service.repairInput(device.udid, ctx.signal);
+              assertAttached(threadId, device.udid);
+              controls.ensure(device.udid, threadId, "agent");
+              const operation = controls.beginAgent(device.udid, threadId, ctx.signal);
+              let repaired: boolean;
+              try {
+                await ensureConsent(threadId, device, operation.signal);
+                ({ repaired } = await service.repairInput(device.udid, operation.signal));
+              }
+              finally { operation.release(); }
               return {
                 exitCode: 0,
                 stdout: repaired
@@ -984,7 +1245,20 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
               const device = await service.resolveDevice(threadId, input.positionals.device ?? null, {
                 signal: ctx.signal,
               });
-              await service.detach(threadId, device.udid, { shutdown: input.options.shutdown });
+              const operation = input.options.shutdown || controls.state(device.udid)?.threadId === threadId
+                ? controls.beginAgent(device.udid, threadId, ctx.signal) : null;
+              try {
+                if (input.options.shutdown) await ensureConsent(threadId, device, operation?.signal ?? ctx.signal);
+                operation?.signal.throwIfAborted();
+                await service.detach(threadId, device.udid, {
+                  shutdown: input.options.shutdown,
+                  signal: operation?.signal ?? ctx.signal,
+                });
+                operation?.signal.throwIfAborted();
+              } finally {
+                if (!service.attachedTo(threadId).includes(device.udid)) controls.release(device.udid, threadId);
+                operation?.release();
+              }
               return {
                 exitCode: 0,
                 stdout: `${input.options.shutdown ? "Shut down" : "Detached"} ${device.name}.`,
@@ -996,6 +1270,8 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
     );
 
     bb.onDispose(async () => {
+      controls.dispose();
+      replay.dispose();
       await service.dispose();
     });
     bb.log.info("iOS Simulator plugin loaded");

@@ -27,6 +27,7 @@ function manager(options: {
   healthyAfter?: number;
   node?: ReturnType<typeof resolveNodeCommand>;
   webSocket?: typeof WebSocket;
+  freePort?: () => Promise<number>;
 }) {
   const child = options.child ?? new FakeChild();
   const spawn = vi.fn(() => child as unknown as ChildProcess);
@@ -49,7 +50,7 @@ function manager(options: {
     serveSim: () => ({ kind: "script", path: "/plugin/node_modules/serve-sim/dist/serve-sim.js", source: "dependency" }),
     spawn: spawn as never,
     fetch: fetchFn as unknown as typeof fetch,
-    freePort: async () => 43210,
+    freePort: options.freePort ?? (async () => 43210),
     onChange,
     healthTimeoutMs: 2_000,
     pollIntervalMs: 5,
@@ -208,6 +209,25 @@ describe("resolveServeSimEntry", () => {
 });
 
 describe("StreamManager", () => {
+  it("does not allocate or spawn for an already cancelled startup", async () => {
+    const freePort = vi.fn(async () => 43210);
+    const { streams, spawn } = manager({ freePort });
+    const controller = new AbortController(); controller.abort();
+    await expect(streams.ensure("UDID", controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+    expect(freePort).not.toHaveBeenCalled(); expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("does not spawn a helper when cancellation happens during free-port allocation", async () => {
+    let resolvePort!: (port: number) => void;
+    const freePort = vi.fn(() => new Promise<number>(resolve => { resolvePort = resolve; }));
+    const { streams, spawn } = manager({ freePort });
+    const controller = new AbortController();
+    const pending = streams.ensure("UDID", controller.signal);
+    controller.abort(); resolvePort(43210);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(spawn).not.toHaveBeenCalled(); expect(streams.list()).toEqual([]);
+  });
+
   it("spawns serve-sim for a device and resolves once the helper is healthy", async () => {
     const { streams, spawn, child, onChange } = manager({ healthyAfter: 3 });
     const session = await streams.ensure("UDID-1");

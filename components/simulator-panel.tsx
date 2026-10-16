@@ -35,6 +35,7 @@ import { cn } from "@/lib/utils";
 import { BEZEL_ASSET_VERSION, fitBezel, isDeviceBezel, type DeviceBezel } from "@/lib/device-bezel";
 import { displayPointToRaw, screenGeometry } from "@/lib/screen-geometry";
 import { startVideoStream, webCodecsAvailable, type VideoStats } from "@/components/video-stream";
+import { ReplayPanel } from "@/components/replay-panel";
 
 type Device = SimulatorState["devices"][number];
 type Session = SimulatorState["sessions"][number];
@@ -49,9 +50,9 @@ export function pluginHttpBase(pluginId: string): string {
   return `/api/v1/plugins/${pluginId}/http`;
 }
 
-function hidSocketUrl(base: string, udid: string): string {
+function hidSocketUrl(base: string, udid: string, threadId: string): string {
   const origin = window.location.origin.replace(/^http/, "ws");
-  return `${origin}${base}/hid?udid=${encodeURIComponent(udid)}`;
+  return `${origin}${base}/hid?udid=${encodeURIComponent(udid)}&threadId=${encodeURIComponent(threadId)}`;
 }
 
 /** A reconnecting binary WebSocket to the plugin's HID relay for one device. */
@@ -173,29 +174,36 @@ export function fitDevice(
 }
 
 function DeviceScreen({
+  threadId,
   udid,
   session,
   base,
   kind,
   agentActive,
   inputShadowed,
+  inputEnabled,
   onShortcut,
   onConfig,
   onStats,
   onPasteText,
 }: {
+  threadId: string;
   udid: string;
   session: Session;
   base: string;
   kind: DeviceKind;
   agentActive: boolean;
   inputShadowed: boolean;
+  inputEnabled: boolean;
   onShortcut: (shortcut: Shortcut) => void;
   onConfig: (config: ScreenConfig | null) => void;
   onStats: (stats: VideoStats | null) => void;
   onPasteText: (text: string) => void;
 }) {
-  const { send, config, connected } = useHidSocket(hidSocketUrl(base, udid));
+  const { send: sendHid, config, connected } = useHidSocket(hidSocketUrl(base, udid, threadId));
+  const send = useCallback((opcode: number, payload: unknown) => {
+    if (inputEnabled) sendHid(opcode, payload);
+  }, [inputEnabled, sendHid]);
   const [nonce, setNonce] = useState(0);
   const [loaded, setLoaded] = useState(false);
   const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(null);
@@ -213,6 +221,13 @@ function DeviceScreen({
   // one position per display refresh, so coalesce them.
   const pendingMove = useRef<{ x: number; y: number } | null>(null);
   const moveFrame = useRef<number | null>(null);
+  useEffect(() => {
+    if (inputEnabled) return;
+    pointerDown.current = false;
+    pendingMove.current = null;
+    if (moveFrame.current !== null) cancelAnimationFrame(moveFrame.current);
+    moveFrame.current = null;
+  }, [inputEnabled]);
   const flushMove = useCallback(() => {
     moveFrame.current = null;
     const point = pendingMove.current;
@@ -352,7 +367,7 @@ function DeviceScreen({
   };
 
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
+    if (!inputEnabled || event.button !== 0) return;
     event.preventDefault();
     event.currentTarget.focus();
     const point = normalized(event);
@@ -362,14 +377,14 @@ function DeviceScreen({
     send(HID.TOUCH, { type: "begin", ...point });
   };
   const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!pointerDown.current) return;
+    if (!inputEnabled || !pointerDown.current) return;
     const point = normalized(event);
     if (!point) return;
     pendingMove.current = point;
     if (moveFrame.current === null) moveFrame.current = requestAnimationFrame(flushMove);
   };
   const onPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!pointerDown.current) return;
+    if (!inputEnabled || !pointerDown.current) return;
     // Deliver the last move before the lift so a fast flick keeps its velocity.
     if (moveFrame.current !== null) {
       cancelAnimationFrame(moveFrame.current);
@@ -381,6 +396,7 @@ function DeviceScreen({
   };
   const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     const shortcut = shortcutFor(event);
+    if (!inputEnabled && !shortcut?.screenshot) return;
     if (shortcut) {
       event.preventDefault();
       onShortcut(shortcut);
@@ -454,7 +470,8 @@ function DeviceScreen({
         ) : null}
       <div
         ref={surfaceRef}
-        tabIndex={0}
+        tabIndex={inputEnabled ? 0 : -1}
+        aria-disabled={!inputEnabled}
         role="application"
         aria-label="Simulator screen. Click to tap, drag to swipe, type to send keys."
         className="absolute overflow-hidden bg-black outline-none ring-ring focus-visible:ring-2"
@@ -470,6 +487,7 @@ function DeviceScreen({
         onPointerCancel={onPointerUp}
         onKeyDown={onKeyDown}
         onPaste={(event) => {
+          if (!inputEnabled) return;
           const text = event.clipboardData.getData("text/plain");
           if (!text) return;
           event.preventDefault();
@@ -579,6 +597,7 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
   const [state, setState] = useState<SimulatorState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [replaying, setReplaying] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [activity, setActivity] = useState<Record<string, number>>({});
   const [screen, setScreen] = useState<ScreenConfig | null>(null);
@@ -604,6 +623,7 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
     return () => clearInterval(timer);
   }, [refetch]);
   useRealtime("sessions-changed", refetch);
+  useRealtime("control-changed", refetch);
   useRealtime("attached", (payload) => {
     const signal = payload as { threadId?: unknown; udid?: unknown } | null;
     if (signal?.threadId === threadId && typeof signal.udid === "string") {
@@ -632,8 +652,17 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
   const activeSession = sessions.find((session) => session.udid === activeUdid) ?? null;
   const activeDevice = devices.find((device) => device.udid === activeUdid) ?? null;
   const isAttached = activeUdid !== null && attached.includes(activeUdid);
+  const controller = activeUdid ? state?.controls[activeUdid] : undefined;
+  const ownsHumanControl = isAttached && controller?.threadId === threadId && controller.mode === "human";
+  const canDrive = ownsHumanControl && !replaying && busy !== "control";
+  const controlLabel = !controller ? "Watching only" : controller.threadId !== threadId
+    ? "Another thread controls" : controller.mode === "human" ? "You control" : "Agent controls";
   const agentActive =
     activeUdid !== null && Date.now() - (activity[activeUdid] ?? 0) < AGENT_BADGE_MS;
+
+  useEffect(() => {
+    setReplaying(false);
+  }, [activeUdid, isAttached]);
 
   useEffect(() => {
     const requested = requestedOrientation.current;
@@ -663,17 +692,17 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
       setSelected(result.udid);
     });
   const detach = (shutdown: boolean) => {
-    if (!activeUdid) return;
+    if (!activeUdid || (shutdown && !canDrive)) return;
     void run(shutdown ? "shutdown" : "detach", () =>
       rpc.call("detach", { threadId, udid: activeUdid, shutdown }),
     );
   };
   const pressButton = (button: HardwareButton) => {
-    if (!activeUdid) return;
-    void runControl(button, () => rpc.call("button", { udid: activeUdid, button }));
+    if (!activeUdid || !canDrive) return;
+    void runControl(button, () => rpc.call("button", { threadId, udid: activeUdid, button }));
   };
   const rotate = () => {
-    if (!activeUdid || controlsInFlight.current.has(`${activeUdid}:rotate`)) return;
+    if (!activeUdid || !canDrive || controlsInFlight.current.has(`${activeUdid}:rotate`)) return;
     // Config arrives asynchronously; rapid presses should advance from the
     // requested orientation instead of sending the same rotation twice.
     const previous = requestedOrientation.current?.udid === activeUdid
@@ -681,7 +710,7 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
     const requested = { udid: activeUdid, orientation: nextOrientation(previous) };
     requestedOrientation.current = requested;
     void runControl("rotate", async () => {
-      try { await rpc.call("rotate", requested); }
+      try { await rpc.call("rotate", { threadId, ...requested }); }
       catch (error) {
         if (requestedOrientation.current === requested) requestedOrientation.current = null;
         throw error;
@@ -716,15 +745,10 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
     if (shortcut.rotate) rotate();
     if (shortcut.screenshot) screenshot();
   };
-  const setConsent = (allow: boolean) => {
-    if (!activeUdid) return;
-    void run("consent", () => rpc.call("setConsent", { udid: activeUdid, allow }));
-  };
-
   const repairInput = () => {
-    if (!activeUdid) return;
+    if (!activeUdid || !canDrive) return;
     void run("repair", async () => {
-      const { repaired } = await rpc.call("repairInput", { udid: activeUdid });
+      const { repaired } = await rpc.call("repairInput", { threadId, udid: activeUdid });
       toast[repaired ? "success" : "message"](
         repaired
           ? "Input repaired. Running apps were closed; relaunch your app."
@@ -732,9 +756,16 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
       );
     });
   };
+  const handoff = (mode: "human" | "agent") => {
+    if (!activeUdid || !isAttached || (mode === "agent" && !ownsHumanControl)) return;
+    const udid = activeUdid;
+    void run("control", async () => {
+      const next = await rpc.call("control", { threadId, udid, mode });
+      setState((previous) => previous ? { ...previous, controls: { ...previous.controls, [udid]: next } } : previous);
+    });
+  };
 
   const problems = state?.ready.problems ?? [];
-  const consentState = activeUdid ? state?.consent[activeUdid] : undefined;
   const inputShadowed = activeUdid !== null && (state?.inputShadowed ?? []).includes(activeUdid);
 
   return (
@@ -796,6 +827,15 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
         )}
       </div>
 
+      {isAttached && activeSession && activeUdid ? <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-1.5">
+        <span role="status" className="text-xs text-muted-foreground">{controlLabel}{replaying ? " · Viewing replay" : ""}</span>
+        <span title={ownsHumanControl && state?.agentControl === "never" ? "Agent control is turned off in plugin settings" : undefined}>
+        <Button size="sm" variant="outline" disabled={busy === "control" || (ownsHumanControl && state?.agentControl === "never")} onClick={() => handoff(ownsHumanControl ? "agent" : "human")}>
+          {busy === "control" ? "Changing control…" : ownsHumanControl ? "Let agent drive" : "Take control"}
+        </Button>
+        </span>
+      </div> : null}
+
       {error ? (
         <p role="alert" className="border-b border-border px-3 py-2 text-xs text-destructive">
           {error}
@@ -827,7 +867,7 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
               closes running apps. Closing the device window in Device Hub avoids it.
             </p>
           </div>
-          <Button size="sm" variant="outline" onClick={repairInput} disabled={busy !== null}>
+          <Button size="sm" variant="outline" onClick={repairInput} disabled={busy !== null || !canDrive}>
             <Icon
               name={glyph(busy === "repair" ? "spinner" : "wrench")}
               className={cn("size-4", busy === "repair" && "animate-spin")}
@@ -837,23 +877,28 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
         </div>
       ) : null}
 
-      {activeSession && activeUdid ? (
+      {isAttached && activeSession && activeUdid ? <ReplayPanel key={`${threadId}:${activeUdid}`} base={base} threadId={threadId} udid={activeUdid}
+        status={state?.replay[activeUdid]} onModeChange={setReplaying} onSaved={refetch} /> : null}
+
+      {activeSession && activeUdid ? (!replaying ? (
         <DeviceScreen
           key={`${activeUdid}:${activeSession.startedAt}`}
           udid={activeUdid}
+          threadId={threadId}
           session={activeSession}
           base={base}
           kind={deviceKindFor(activeDevice?.name)}
           agentActive={agentActive}
           inputShadowed={inputShadowed}
+          inputEnabled={canDrive}
           onShortcut={onShortcut}
           onConfig={setScreen}
           onStats={setVideoStats}
           onPasteText={(text) => {
-            rpc.call("pasteText", { udid: activeUdid, text }).catch((cause) => toast.error(describe(cause)));
+            if (canDrive) rpc.call("pasteText", { threadId, udid: activeUdid, text }).catch((cause) => toast.error(describe(cause)));
           }}
         />
-      ) : (
+      ) : null) : (
         <div className="flex min-h-0 flex-1 items-center justify-center p-6">
           <div className="max-w-xs text-center">
             <Icon name="Smartphone" className="mx-auto size-8 text-muted-foreground" />
@@ -878,32 +923,18 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
       {activeSession && activeUdid ? (
         <div className="shrink-0 border-t border-border px-2 py-1.5">
           <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Simulator controls">
-          <ControlButton icon={glyph("home")} label="Home (⌘⇧H)" onClick={() => pressButton("home")} pending={controlPending("home")} />
-          <ControlButton icon={glyph("lock")} label="Lock (⌘L)" onClick={() => pressButton("lock")} pending={controlPending("lock")} />
-          <ControlButton icon={glyph("volume-up")} label="Volume up (⌘↑)" onClick={() => pressButton("volume-up")} pending={controlPending("volume-up")} />
-          <ControlButton icon={glyph("volume-down")} label="Volume down (⌘↓)" onClick={() => pressButton("volume-down")} pending={controlPending("volume-down")} />
-          <ControlButton icon={glyph("rotate")} label="Rotate (⌘→)" onClick={rotate} pending={controlPending("rotate")} />
+          <ControlButton icon={glyph("home")} label="Home (⌘⇧H)" onClick={() => pressButton("home")} disabled={!canDrive} pending={controlPending("home")} />
+          <ControlButton icon={glyph("lock")} label="Lock (⌘L)" onClick={() => pressButton("lock")} disabled={!canDrive} pending={controlPending("lock")} />
+          <ControlButton icon={glyph("volume-up")} label="Volume up (⌘↑)" onClick={() => pressButton("volume-up")} disabled={!canDrive} pending={controlPending("volume-up")} />
+          <ControlButton icon={glyph("volume-down")} label="Volume down (⌘↓)" onClick={() => pressButton("volume-down")} disabled={!canDrive} pending={controlPending("volume-down")} />
+          <ControlButton icon={glyph("rotate")} label="Rotate (⌘→)" onClick={rotate} disabled={!canDrive} pending={controlPending("rotate")} />
           <ControlButton icon={glyph("camera")} label="Save screenshot (⌘S)" onClick={screenshot} />
           <span className="flex-1" />
-          {state?.agentControl === "ask" ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-7 px-2 text-[11px]"
-              onClick={() => setConsent(consentState !== true)}
-                    >
-              <Icon
-                name={glyph(consentState === true ? "shield-check" : "shield-off")}
-                className="size-3.5"
-              />
-              {consentState === true ? "Agent allowed" : "Let agent use it"}
-            </Button>
-          ) : null}
           <ControlButton
             icon={glyph("power")}
             label="Shut down the simulator"
             onClick={() => detach(true)}
-            disabled={busy !== null}
+            disabled={busy !== null || !canDrive}
             destructive
           />
           </div>

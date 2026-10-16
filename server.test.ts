@@ -5,6 +5,7 @@ import type { Exec, ExecResult } from "./server/simctl";
 import { DEVICE_LIST } from "./server/simctl.test";
 import type { HidConnection, StreamManager, StreamSession } from "./server/stream-manager";
 import { HID, decodeHid } from "./lib/sim-protocol";
+import { ReplayRecorder } from "./server/replay";
 
 function fakeExec(overrides: (file: string, args: string[]) => Partial<ExecResult> | undefined = () => undefined) {
   const calls: string[][] = [];
@@ -68,6 +69,14 @@ function fakeStreams() {
     observeHid: (callback: typeof observeFrame) => { observeFrame = callback; } };
 }
 
+function fakeReplay(): ReplayRecorder {
+  return {
+    ensure: vi.fn(), stop: vi.fn(), dispose: vi.fn(), record: vi.fn(), setConfig: vi.fn(), watchApp: vi.fn(),
+    status: () => ({ recording: false, bufferedMs: 0, bytes: 0, error: null, app: null, diagnostics: null, clips: [] }),
+    events: () => [],
+  } as unknown as ReplayRecorder;
+}
+
 async function load(options: { settings?: Record<string, unknown>; execScript?: Parameters<typeof fakeExec>[0] } = {}) {
   const { exec, calls, inputs } = fakeExec(options.execScript);
   const fake = fakeStreams();
@@ -75,7 +84,7 @@ async function load(options: { settings?: Record<string, unknown>; execScript?: 
     pluginId: "ios-simulator",
     settings: { agentControl: "always", ...options.settings },
   });
-  await createPlugin({ exec, streams: fake.streams })(bb);
+  await createPlugin({ exec, streams: fake.streams, replay: fakeReplay() })(bb);
   return { bb, harness, calls, inputs, ...fake };
 }
 
@@ -89,8 +98,8 @@ describe("iOS Simulator plugin", () => {
       "ios_sim_attach", "ios_sim_describe_ui", "ios_sim_detach", "ios_sim_install_and_launch",
       "ios_sim_launch", "ios_sim_list_devices", "ios_sim_open_url", "ios_sim_paste", "ios_sim_press_button",
       "ios_sim_repair_input", "ios_sim_rotate", "ios_sim_screenshot", "ios_sim_set_appearance", "ios_sim_swipe",
-      "ios_sim_tap", "ios_sim_type",
-    ]);
+      "ios_sim_tap", "ios_sim_type", "ios_sim_session", "ios_sim_save_replay",
+    ].sort());
     expect(harness.registrations.httpRoutes.map((route) => route.path)).toEqual(expect.arrayContaining(["/screenshot", "/stream", "/video"]));
     expect(harness.registrations.cli?.name).toBe("ios-simulator");
   });
@@ -288,14 +297,14 @@ describe("iOS Simulator plugin", () => {
     const { exec } = fakeExec();
     const fake = fakeStreams();
     const { bb, harness } = createFakePluginHost({ pluginId: "ios-simulator", settings: { agentControl: "always" } });
-    await createPlugin({ exec, streams: fake.streams })(bb);
+    await createPlugin({ exec, streams: fake.streams, replay: fakeReplay() })(bb);
     await harness.behavior.callAgentTool("ios_sim_attach", {}, CTX);
     expect(fake.streams.ensure).toHaveBeenCalledTimes(1);
     fake.sessions.clear(); // the old generation's processes are gone
-    await harness.lifecycle.reload(createPlugin({ exec, streams: fake.streams }));
+    await harness.lifecycle.reload(createPlugin({ exec, streams: fake.streams, replay: fakeReplay() }));
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(fake.streams.ensure).toHaveBeenCalledTimes(2);
-    expect(fake.streams.ensure).toHaveBeenLastCalledWith("AAAA-2");
+    expect(fake.streams.ensure).toHaveBeenLastCalledWith("AAAA-2", expect.any(AbortSignal));
   });
 
   it("stops every stream on dispose", async () => {

@@ -5,7 +5,8 @@ build, launch, and test on the same device.
 
 - **Live panel.** Choose a device and Attach to boot and stream it. Click to
   tap, drag to swipe, and focus the screen to type. Paste text with ⌘V,
-  including Unicode and multiline text. ⌘⇧H goes home, ⌘L locks, ⌘↑/↓ changes
+  including Unicode and multiline text. Choose **Take control** before using
+  the screen, then **Let agent drive** to hand it back. ⌘⇧H goes home, ⌘L locks, ⌘↑/↓ changes
   volume, ⌘→ rotates, and ⌘S saves a PNG.
 - **Thread shortcut.** The Simulator button in the thread header opens the
   panel. Attaching a device from an agent also opens it automatically.
@@ -19,6 +20,10 @@ build, launch, and test on the same device.
   `ios_sim_open_url`,
   `ios_sim_set_appearance`, `ios_sim_launch`, `ios_sim_list_devices`,
   `ios_sim_detach`, and `ios_sim_repair_input`.
+- **Replay and diagnostics (local development).** Keep the last 30 seconds of
+  iOS video, capture a replay, and seek through its input/app-log/crash timeline.
+  `ios_sim_session` reads session health and recent events;
+  `ios_sim_save_replay` captures a replay without taking control.
 - **Consent.** The first agent control request asks for permission once per
   device. Change this under Settings → iOS Simulator.
 - **Lifecycle.** Archiving or deleting a thread shuts down simulators this
@@ -53,9 +58,50 @@ bb plugin install .
 Open a thread and use its Simulator header button, or choose **iOS Simulator**
 from the panel's new-tab menu. You can also ask the agent to run your app.
 
-A public Git release and marketplace entry are being prepared. See
-[the release plan](release/RELEASE_PLAN.md) for the proposed source and pending
-publication checks.
+The public [v0.1.0 source](https://github.com/peteabu/bb-plugin-ios-simulator/tree/v0.1.0)
+and [marketplace submission](https://github.com/get-bb/marketplace/pull/578)
+are available. The replay/control changes in this working tree are local
+development work awaiting their own release.
+
+See the [replay/control design](docs/REPLAY_AND_CONTROL.md) and
+[verification record](docs/REPLAY_VERIFICATION.md) for the local changes.
+
+## Replay and shared control
+
+The iOS backend keeps up to 30 seconds of video and timestamped input in
+memory while attached. **Save last 30s** captures the available window; choose
+Replay to play, pause, scrub, or jump to a timeline event. Replay cannot send
+input to the live device. **Live** returns to the current simulator.
+
+Replays are temporary: detaching or reloading clears them. Download replay
+JSON to retain the encoded H.264 video, timing, orientation and events.
+Playback in the panel requires WebCodecs. Up to three snapshots share a
+64 MiB limit; each device's live buffer is capped at 32 MiB and can contain
+less than 30 seconds under that limit. Decoding retains an earlier keyframe
+without displaying frames before the selected window.
+
+One thread controls each iOS device. A new panel attachment claims human
+control; an agent attachment claims agent control. Attaching as an observer
+never replaces another thread's owner or undoes an explicit handoff.
+**Take control** cancels pending agent input and invalidates old input sockets.
+**Let agent drive** grants permission and returns control in one action.
+The global Agent control setting still applies. Other threads can observe;
+they cannot launch apps, type, rotate, repair, or shut down that device.
+Ownership is released when its thread detaches or closes and resets on reload.
+
+Launching an app through the plugin follows that app's PID for logs and
+matches new crash reports against the app, process and simulator. Diagnostics
+show their availability; an unsupported report is never treated as a verified
+crash. Timeline times reflect collection at the server. Crash reports can
+arrive after the crash, so their appearance can be delayed. Typed text is
+represented by a character count in input events; video still shows the screen.
+
+CLI equivalents:
+
+```sh
+bb ios-simulator session [device] --thread <thread-id>
+bb ios-simulator replay [device] --thread <thread-id>
+```
 
 ## How it works
 
