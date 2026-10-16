@@ -13,8 +13,11 @@ Source: https://github.com/EvanBacon/serve-sim/tree/6d009686ed08f7d8bd19bca9f9f6
 The `native/serve-sim` Swift source, tests, package manifest, and upstream build
 script come from the published `serve-sim@0.1.48` npm package. The plugin changes
 `Sources/SimNative/FrameCapture.swift` to poll the framebuffer change counter
-for headless simulators. A change notice is present in that file. The local
-build-only npm metadata and plugin build script are maintained separately.
+for headless simulators and `Sources/SimNative/CaptureEngine.swift` to share
+one AVCC encoder across independently bounded subscribers. Change notices
+are present in both files. The added `SimNativeSupport/AVCCBroadcast.swift`,
+its tests, local build-only npm metadata and plugin build script are
+plugin-maintained code.
 See `native/serve-sim/PROVENANCE.md` for verified source hashes and build steps.
 
 The complete upstream Apache license and copyright notice are in

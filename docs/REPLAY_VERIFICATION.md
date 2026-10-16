@@ -1,7 +1,10 @@
 # Replay and control verification
 
-Local development verification, 16 October 2026. This does not amend the
-published v0.1.0 release or approve publication of these changes.
+Replay implementation verification, 16 October 2026. This records the initial
+replay checks; subsequent UI and performance verification for v0.1.1 is in
+[PERFORMANCE.md](PERFORMANCE.md). The final v0.1.1 source passed 199 plugin
+tests across 21 files, all 26 native support tests, TypeScript and both builds.
+The published v0.1.0 source remains unchanged.
 
 ## Automated checks
 
@@ -16,7 +19,7 @@ play, pause/resume/end, bounded decoded-frame retention, cancellation and
 stalled-decoder timeouts. Frontend tests cover attachment requirements,
 handoff controls, replay polling/disposal, and preserving live input isolation.
 
-Final source checks passed: 190 tests across 20 files, TypeScript, plugin
+Initial replay source checks passed: 190 tests across 20 files, TypeScript, plugin
 build, and `git diff --check`. Lifecycle regressions also cover pending
 attachment/restoration during disposal, pending HID connection handoff,
 cancelled detach persistence, and shutdown consent cancellation.
@@ -64,7 +67,10 @@ Cua Driver reported a system-permission block while inspecting the new BB
 window. Automation stopped and the user was directed to
 `/settings/plugins/cua-driver` to make this machine's permission checklist
 Ready. No native BB playback, seek, download, or complete human/agent handoff
-flow is claimed from this run. Those checks remain before a new release.
+flow is claimed from this run. That native-window recheck remains unverified.
+Release validation includes the isolated real-component browser checks,
+native codec/decoder lifecycle harness and integration tests documented in
+PERFORMANCE.md; it does not claim the blocked native-window check passed.
 
 Screenshots, fixture source/build products, polling output and replay metadata
 are kept in the workspace's separate `verification/` directory, outside the

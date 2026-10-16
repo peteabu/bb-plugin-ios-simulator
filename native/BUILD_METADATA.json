@@ -9,7 +9,7 @@
       "serveSimGitHead": "6d009686ed08f7d8bd19bca9f9f67a9237931f44",
       "target": "arm64-apple-macosx14.0",
       "command": "npm run build:native",
-      "sha256": "bb01fbdd03bd0a1d506986b1d86e3de91967b077bc5eb6a2dc7e86710a1fc7a2"
+      "sha256": "9bdeaa409a7e4b15639175979f53edcb32c708775f62c0ffefc9b7be655fc709"
     },
     {
       "path": "native/simulator-pasteboard",

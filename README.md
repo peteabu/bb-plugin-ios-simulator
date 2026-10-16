@@ -20,7 +20,7 @@ build, launch, and test on the same device.
   `ios_sim_open_url`,
   `ios_sim_set_appearance`, `ios_sim_launch`, `ios_sim_list_devices`,
   `ios_sim_detach`, and `ios_sim_repair_input`.
-- **Replay and diagnostics (local development).** Keep the last 30 seconds of
+- **Replay and diagnostics.** Keep the last 30 seconds of
   iOS video, capture a replay, and seek through its input/app-log/crash timeline.
   `ios_sim_session` reads session health and recent events;
   `ios_sim_save_replay` captures a replay without taking control.
@@ -58,13 +58,14 @@ bb plugin install .
 Open a thread and use its Simulator header button, or choose **iOS Simulator**
 from the panel's new-tab menu. You can also ask the agent to run your app.
 
-The public [v0.1.0 source](https://github.com/peteabu/bb-plugin-ios-simulator/tree/v0.1.0)
-and [marketplace submission](https://github.com/get-bb/marketplace/pull/578)
-are available. The replay/control changes in this working tree are local
-development work awaiting their own release.
+The public [v0.1.1 source](https://github.com/peteabu/bb-plugin-ios-simulator/tree/v0.1.1)
+includes replay, explicit control handoff and the updated device picker.
+The [marketplace submission](https://github.com/get-bb/marketplace/pull/578)
+tracks compatible releases and is awaiting review.
 
-See the [replay/control design](docs/REPLAY_AND_CONTROL.md) and
-[verification record](docs/REPLAY_VERIFICATION.md) for the local changes.
+See the [replay/control design](docs/REPLAY_AND_CONTROL.md),
+[verification record](docs/REPLAY_VERIFICATION.md) and
+[performance checks](docs/PERFORMANCE.md) for implementation and validation details.
 
 ## Replay and shared control
 
@@ -76,7 +77,8 @@ Open **Activity** for the event timeline, app diagnostics and replay downloads.
 The control dock keeps Home, Lock, Rotate and Screenshot in reach; **Device
 options** contains volume, stream details, Detach and Shut down.
 
-Replays are temporary: detaching or reloading clears them. Download replay
+Replays are temporary: removing the device's last attachment or reloading the
+plugin clears them. Download replay
 JSON to retain the encoded H.264 video, timing, orientation and events.
 Playback in the panel requires WebCodecs. Up to three snapshots share a
 64 MiB limit; each device's live buffer is capped at 32 MiB and can contain
@@ -90,7 +92,8 @@ never replaces another thread's owner or undoes an explicit handoff.
 **Let agent drive** grants permission and returns control in one action.
 The global Agent control setting still applies. Other threads can observe;
 they cannot launch apps, type, rotate, repair, or shut down that device.
-Ownership is released when its thread detaches or closes and resets on reload.
+Ownership is released when its thread detaches, is archived or is deleted,
+and resets on reload.
 
 Launching an app through the plugin follows that app's PID for logs and
 matches new crash reports against the app, process and simulator. Diagnostics
