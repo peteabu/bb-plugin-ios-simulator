@@ -1,6 +1,7 @@
 // Installs the plugin's rebuilt serve-sim capture module (native/
 // serve-sim-native.node, built from native/serve-sim with the framebuffer
-// polling patch) over the copy that ships inside the serve-sim dependency.
+// polling and shared AVCC encoder patches) over the copy that ships inside
+// the serve-sim dependency.
 // The original is kept beside it as `.orig` and restored on request.
 import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";

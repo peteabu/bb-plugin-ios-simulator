@@ -48,29 +48,75 @@ describe("replay panel", () => {
     slot.lifecycle.unmount();
   });
 
-  it("polls lightweight status/activity, bounds live events and stops polling on unmount", async () => {
+  it("polls lightweight readiness, fetches live activity only while open, and stops on unmount", async () => {
     vi.useFakeTimers();
     let ready = false;
     const state = vi.fn(() => ({ ...STATUS, recording: ready, bufferedMs: ready ? 600 : 0 }));
     const events = Array.from({ length: 150 }, (_, index) => ({ id: String(index), at: index, kind: "log", actor: "system", label: `Log ${index}` }));
+    const timeline = vi.fn(() => events);
     const slot = renderSlot({ component: ReplayPanel }, { base: "/plugin", threadId: "thr_1", udid: "device", status: undefined, onModeChange() {}, onSaved() {} }, {
-      rpc: { timeline: () => events, replayState: state },
+      rpc: { timeline, replayState: state },
     });
     await act(async () => { await Promise.resolve(); });
     expect((slot.getByRole("button", { name: "Capture 30s" }) as HTMLButtonElement).disabled).toBe(true);
     expect(slot.queryByText("Log 0")).toBeNull();
     expect(slot.queryByText("Log 149")).toBeNull();
-    fireEvent.click(slot.getByRole("button", { name: "Activity" }));
+    expect(timeline).not.toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(state).toHaveBeenCalledTimes(2);
+    expect(timeline).not.toHaveBeenCalled();
+    await act(async () => { fireEvent.click(slot.getByRole("button", { name: "Activity" })); });
     expect(slot.getByText("Log 149")).toBeTruthy();
     expect(slot.queryByText("Log 49")).toBeNull();
+    expect(timeline).toHaveBeenCalledTimes(1);
     ready = true;
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect((slot.getByRole("button", { name: "Capture 30s" }) as HTMLButtonElement).disabled).toBe(false);
-    expect(state).toHaveBeenCalledTimes(2);
+    expect(state).toHaveBeenCalledTimes(4);
+    expect(timeline).toHaveBeenCalledTimes(2);
+    await act(async () => { fireEvent.click(slot.getByRole("button", { name: "Activity" })); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(timeline).toHaveBeenCalledTimes(2);
+    const callsBeforeUnmount = state.mock.calls.length;
     slot.lifecycle.unmount();
     await vi.advanceTimersByTimeAsync(4000);
-    expect(state).toHaveBeenCalledTimes(2);
+    expect(state).toHaveBeenCalledTimes(callsBeforeUnmount);
     expect(slot.inspection.rpcCalls.every((call) => call.method === "replayState" || call.method === "timeline")).toBe(true);
+  });
+
+  it("keeps replay transport and event highlighting synchronized without polling live data", async () => {
+    vi.useFakeTimers();
+    let callbacks: Parameters<typeof playback.createReplayPlayer>[2] | undefined;
+    const instance = { seek: vi.fn(async () => {}), play: vi.fn(async () => {}), pause: vi.fn(), dispose: vi.fn() };
+    vi.spyOn(playback, "createReplayPlayer").mockImplementation((_canvas, _clip, next) => { callbacks = next; return instance; });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => CLIP })));
+    const state = vi.fn(() => STATUS);
+    const timeline = vi.fn(() => []);
+    const slot = renderSlot({ component: ReplayPanel }, { base: "/plugin", threadId: "thr_1", udid: "device", status: STATUS, onModeChange() {}, onSaved() {} }, {
+      rpc: { timeline, replayState: state },
+    });
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { fireEvent.click(slot.getByRole("button", { name: "Replay", exact: true })); });
+    expect(callbacks).toBeDefined();
+    await act(async () => { fireEvent.click(slot.getByRole("button", { name: "Activity" })); });
+    const stateCalls = state.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+    expect(state).toHaveBeenCalledTimes(stateCalls);
+    expect(timeline).not.toHaveBeenCalled();
+    const slider = slot.getByRole("slider", { name: "Replay position" }) as HTMLInputElement;
+    const event = slot.getByRole("button", { name: /Tapped Search/ });
+    act(() => callbacks!.onTime(1200));
+    expect(slider.value).toBe("1200");
+    expect(event.getAttribute("aria-current")).toBeNull();
+    act(() => callbacks!.onTime(1300));
+    expect(event.getAttribute("aria-current")).toBe("true");
+    act(() => callbacks!.onTime(1400));
+    expect(slider.value).toBe("1400");
+    expect(event.getAttribute("aria-current")).toBe("true");
+    await act(async () => { fireEvent.click(slot.getByRole("button", { name: "Live", exact: true })); });
+    expect(state).toHaveBeenCalledTimes(stateCalls + 1);
+    expect(timeline).toHaveBeenCalledTimes(1);
+    slot.lifecycle.unmount();
   });
 
   it("does not switch another device into replay when a save finishes after unmount", async () => {

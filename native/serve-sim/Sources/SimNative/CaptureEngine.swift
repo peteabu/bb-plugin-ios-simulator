@@ -2,6 +2,10 @@ import Foundation
 import CoreVideo
 import CoreMedia
 import os
+import SimNativeSupport
+
+// Modified for bb-plugin-ios-simulator: one AVCC encoder per capture engine,
+// with independently bounded, keyframe-safe subscriber delivery.
 
 // The capture + encode engine, reused verbatim from SimStreamHelper. Replicates
 // main.swift's frameHandler: MJPEG always encodes while clients exist; H.264 runs
@@ -76,6 +80,9 @@ actor CaptureEngine {
 
     // mjpeg is stateless so we can share a single encoder instance
     private let mjpegEncoder = MJPEGEncoder()
+    private var avccBroadcast: AVCCBroadcast?
+    private var avccSubscriptions = Set<UUID>()
+    private var unsubscribeAVCC: (@Sendable () async -> Void)?
 
     private(set) var screenSize = Dimensions(width: 0, height: 0)
     private var consumers = [UUID: CaptureConsuming]()
@@ -136,7 +143,7 @@ actor CaptureEngine {
         }
         let id = UUID()
         consumers[id] = consumer
-        return { await self.removeConsumer(id) }
+        return { [weak self] in await self?.removeConsumer(id) }
     }
 
     private func removeConsumer(
@@ -164,40 +171,50 @@ actor CaptureEngine {
 
     func addAVCCConsumer(
         onFrame: sending @escaping (Dimensions, Data, Int32) async -> Void
-    ) -> (@Sendable () async -> Void) {
-        addConsumer(encoder: AVCCEncoder()) { [weak self] encoded in
-            let flagDescription: Int32 = 1 << 0
-            let flagKeyframe: Int32 = 1 << 1
-
-            guard let self, let encoded else { return }
-            if let description = encoded.description {
-                await onFrame(
-                    screenSize,
-                    AVCCEnvelope.description(avcc: description),
-                    flagDescription,
-                )
-            }
-            switch encoded.kind {
-            case .keyframe:
-                await onFrame(
-                    screenSize,
-                    AVCCEnvelope.keyframe(avcc: encoded.avcc),
-                    flagKeyframe,
-                )
-            case .delta:
-                await onFrame(
-                    screenSize,
-                    AVCCEnvelope.delta(avcc: encoded.avcc),
-                    0,
-                )
+    ) async -> (@Sendable () async -> Void) {
+        guard phase != .stopped else { return {} }
+        if avccBroadcast == nil {
+            let encoder = AVCCEncoder()
+            let broadcast = AVCCBroadcast { await encoder.requestKeyframe() }
+            avccBroadcast = broadcast
+            unsubscribeAVCC = addConsumer(encoder: encoder) { [weak self] encoded in
+                guard let self, let encoded else { return }
+                let key: Bool
+                switch encoded.kind { case .keyframe: key = true; case .delta: key = false }
+                await broadcast.publish(AVCCDeliveryFrame(
+                    data: key ? AVCCEnvelope.keyframe(avcc: encoded.avcc) : AVCCEnvelope.delta(avcc: encoded.avcc),
+                    description: encoded.description.map { AVCCEnvelope.description(avcc: $0) },
+                    isKeyframe: key, width: screenSize.width, height: screenSize.height))
             }
         }
+        let broadcast = avccBroadcast!, id = UUID()
+        avccSubscriptions.insert(id)
+        await broadcast.subscribe(id) { packet in
+            let size = Dimensions(width: packet.width, height: packet.height)
+            if let description = packet.description { await onFrame(size, description, 1 << 0) }
+            guard !Task.isCancelled else { return }
+            await onFrame(size, packet.data, packet.isKeyframe ? 1 << 1 : 0)
+        }
+        return { [weak self] in await self?.removeAVCCConsumer(id, broadcast: broadcast) }
+    }
+
+    private func removeAVCCConsumer(_ id: UUID, broadcast: AVCCBroadcast) async {
+        guard avccBroadcast === broadcast else { return }
+        avccSubscriptions.remove(id)
+        await broadcast.unsubscribe(id)
+        guard avccSubscriptions.isEmpty, avccBroadcast === broadcast else { return }
+        let unsubscribe = unsubscribeAVCC
+        avccBroadcast = nil; unsubscribeAVCC = nil
+        await broadcast.stop()
+        await unsubscribe?()
     }
 
     func stop() {
         if phase == .stopped { return }
         phase = .stopped
         Task { [frameCapture] in await frameCapture.stop() }
+        if let broadcast = avccBroadcast { Task { await broadcast.stop() } }
+        avccBroadcast = nil; unsubscribeAVCC = nil; avccSubscriptions.removeAll()
         consumers.removeAll()
     }
 }
@@ -220,17 +237,20 @@ actor AVCCEncoder: FrameEncoder {
     private static let timeout: Duration = .milliseconds(500)
 
     let h264Encoder = H264Encoder(fps: 60)
-    var forceKeyframe = true
+    private var keyframes = AVCCKeyframeRequests()
 
     init() {}
 
+    func requestKeyframe() { keyframes.request() }
+
     func encode(_ frame: Frame) async throws -> H264Encoder.Encoded? {
         // TODO: cancel after timeout using TaskGroup
+        let generation = keyframes.generation
         let result = try await h264Encoder.encode(
             frame.pixelBuffer,
-            forceKeyframe: forceKeyframe,
+            forceKeyframe: keyframes.needed,
         )
-        if result != nil { forceKeyframe = false }
+        if let result, case .keyframe = result.kind { keyframes.encodedKeyframe(for: generation) }
         return result
     }
 

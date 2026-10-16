@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../server";
 import type { ReplayClip, ReplayClipInfo, ReplayStatus, TimelineEvent } from "@/lib/session-types";
@@ -10,7 +10,8 @@ const timecode = (milliseconds: number) => {
   const total = Math.floor(Math.max(0, milliseconds) / 1000);
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 };
-const clock = (at: number) => new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const clockFormatter = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const clock = (at: number) => clockFormatter.format(at);
 const actorLabel = { human: "You", agent: "Agent", system: "System" };
 const eventLabel = { input: "Input", log: "App log", crash: "Crash", control: "Control", lifecycle: "App activity", error: "Error" };
 type GlyphName = TimelineEvent["kind"] | "capture" | "activity" | "play" | "pause" | "download";
@@ -34,6 +35,30 @@ function Glyph({ name }: { name: GlyphName }) {
 }
 
 const controlMotion = "transition-[background-color,color,opacity] duration-150 motion-reduce:transition-none";
+
+const ActivityEvents = memo(function ActivityEvents({ events, current, viewing, startAt, onSeek }: {
+  events: TimelineEvent[]; current: string | undefined; viewing: boolean; startAt: number | undefined;
+  onSeek(at: number): void;
+}) {
+  return events.length ? <ol className="py-1">
+    {events.slice(-100).map((event) => <li key={event.id} className="replay-event-row">
+      <button type="button" disabled={!viewing || startAt === undefined} aria-current={event.id === current ? "true" : undefined}
+        onClick={() => onSeek(event.at)} className={`flex min-h-10 w-full items-center gap-2 rounded-md px-2 text-left text-xs enabled:hover:bg-muted aria-current:bg-muted disabled:cursor-default ${controlMotion}`}>
+        <span className="shrink-0 text-muted-foreground" title={eventLabel[event.kind]}><Glyph name={event.kind} /></span>
+        <span className="min-w-0 flex-1 break-words py-2">{event.label}</span>
+        {event.actor !== "system" ? <span className="shrink-0 text-[10px] text-muted-foreground">{actorLabel[event.actor]}</span> : null}
+        <time className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{viewing && startAt !== undefined ? timecode(event.at - startAt) : clock(event.at)}</time>
+      </button>
+      {event.detail ? <details className="replay-event-detail ml-8 text-[11px] text-muted-foreground">
+        <summary className="flex min-h-10 cursor-pointer items-center">View details</summary>
+        <p className="whitespace-pre-wrap break-words pb-3">{event.detail}</p>
+      </details> : null}
+    </li>)}
+  </ol> : <div className="replay-activity-empty flex items-center gap-3 px-2 py-5 text-muted-foreground">
+    <Glyph name="activity" /><div><p className="text-xs font-medium text-foreground">{viewing ? "No activity in this capture" : "No activity yet"}</p>
+      <p className="mt-1 text-[11px]">Inputs and app events appear here as you work.</p></div>
+  </div>;
+});
 
 export function ReplayPanel({ base, threadId, udid, status: initialStatus, onModeChange, onSaved, children }: {
   base: string; threadId: string; udid: string; status: ReplayStatus | undefined;
@@ -67,16 +92,18 @@ export function ReplayPanel({ base, threadId, udid, status: initialStatus, onMod
   useEffect(() => {
     let disposed = false;
     const refresh = () => {
-      void rpc.call("timeline", { threadId, udid }).then((next) => {
-        if (!disposed) { setEvents(next.slice(-100)); setTimelineError(null); }
-      }, (cause) => { if (!disposed) setTimelineError(describe(cause)); });
+      if (activityOpen && !viewing) {
+        void rpc.call("timeline", { threadId, udid }).then((next) => {
+          if (!disposed) { setEvents(next.slice(-100)); setTimelineError(null); }
+        }, (cause) => { if (!disposed) setTimelineError(describe(cause)); });
+      }
       void rpc.call("replayState", { threadId, udid }).then((next) => { if (!disposed) setStatus(next); }, () => {});
     };
     refreshRef.current = refresh;
-    refresh();
-    const timer = setInterval(refresh, 2_000);
+    if (!viewing) refresh();
+    const timer = !viewing ? setInterval(refresh, 2_000) : undefined;
     return () => { disposed = true; clearInterval(timer); refreshRef.current = () => {}; };
-  }, [rpc, threadId, udid]);
+  }, [rpc, threadId, udid, activityOpen, viewing]);
   useRealtime("replay-changed", (payload) => {
     if ((payload as { udid?: unknown } | null)?.udid === udid) refreshRef.current();
   });
@@ -118,7 +145,7 @@ export function ReplayPanel({ base, threadId, udid, status: initialStatus, onMod
     } catch (cause) { if (mounted.current) setError(describe(cause)); }
     finally { if (mounted.current) setSaving(false); }
   };
-  const seek = (at: number) => { setPlaying(false); void player.current?.seek(at); };
+  const seek = useCallback((at: number) => { setPlaying(false); void player.current?.seek(at); }, []);
   const togglePlayback = async () => {
     const instance = player.current;
     if (!instance || !clip) return;
@@ -128,7 +155,6 @@ export function ReplayPanel({ base, threadId, udid, status: initialStatus, onMod
     setPlaying(true); await instance.play();
   };
   const timeline = viewing ? clip?.events ?? [] : events;
-  const visibleEvents = timeline.slice(-100);
   const current = viewing ? timeline.filter((event) => event.at <= position).at(-1)?.id : undefined;
 
   return (
@@ -170,26 +196,9 @@ export function ReplayPanel({ base, threadId, udid, status: initialStatus, onMod
       </> : <div className="replay-live relative flex min-h-0 flex-1 flex-col">{children}</div>}
       {activityOpen ? <section id={activityId} aria-label={viewing ? "Replay activity" : "Recent activity"} className="replay-activity flex max-h-[35%] min-h-0 shrink-0 flex-col border-t border-border/60">
         <div className="min-h-0 overflow-y-auto px-3 pb-2">
-          <div className="flex items-center justify-between px-2 pb-1 pt-3 text-[11px] font-medium"><span>Activity</span><span className="tabular-nums text-muted-foreground">{visibleEvents.length}</span></div>
+          <div className="flex items-center justify-between px-2 pb-1 pt-3 text-[11px] font-medium"><span>Activity</span><span className="tabular-nums text-muted-foreground">{Math.min(100, timeline.length)}</span></div>
           {timelineError && !viewing ? <p className="py-3 text-xs text-muted-foreground">Activity unavailable: {timelineError}</p> : null}
-          {visibleEvents.length ? <ol className="py-1">
-          {visibleEvents.map((event) => <li key={event.id} className="replay-event-row">
-            <button type="button" disabled={!viewing || !clip} aria-current={event.id === current ? "true" : undefined}
-              onClick={() => seek(event.at)} className={`flex min-h-10 w-full items-center gap-2 rounded-md px-2 text-left text-xs enabled:hover:bg-muted aria-current:bg-muted disabled:cursor-default ${controlMotion}`}>
-              <span className="shrink-0 text-muted-foreground" title={eventLabel[event.kind]}><Glyph name={event.kind} /></span>
-              <span className="min-w-0 flex-1 break-words py-2">{event.label}</span>
-              {event.actor !== "system" ? <span className="shrink-0 text-[10px] text-muted-foreground">{actorLabel[event.actor]}</span> : null}
-              <time className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{viewing && clip ? timecode(event.at - clip.startAt) : clock(event.at)}</time>
-            </button>
-            {event.detail ? <details className="replay-event-detail ml-8 text-[11px] text-muted-foreground">
-              <summary className="flex min-h-10 cursor-pointer items-center">View details</summary>
-              <p className="whitespace-pre-wrap break-words pb-3">{event.detail}</p>
-            </details> : null}
-          </li>)}
-          </ol> : <div className="replay-activity-empty flex items-center gap-3 px-2 py-5 text-muted-foreground">
-            <Glyph name="activity" /><div><p className="text-xs font-medium text-foreground">{viewing ? "No activity in this capture" : "No activity yet"}</p>
-              <p className="mt-1 text-[11px]">Inputs and app events appear here as you work.</p></div>
-          </div>}
+          <ActivityEvents events={timeline} current={current} viewing={viewing} startAt={clip?.startAt} onSeek={seek} />
           <div className="replay-metadata space-y-2 border-t border-border/50 px-2 py-3 text-[11px] text-muted-foreground">
             <p>{status?.recording ? `${timecode(status.bufferedMs)} ready to capture` : "Capture becomes available when the simulator stream is ready."}</p>
             {status?.error ? <p>{status.error}</p> : null}

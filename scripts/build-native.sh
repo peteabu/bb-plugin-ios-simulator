@@ -1,6 +1,6 @@
 #!/bin/bash
 # Rebuild serve-sim's native capture module with the plugin's framebuffer
-# polling patch (native/serve-sim/Sources/SimNative/FrameCapture.swift) and
+# polling and shared AVCC encoder patches in native/serve-sim/Sources/ and
 # place it at native/serve-sim-native.node, which server.ts installs over the
 # dependency's copy at load. Needs Apple Silicon, Xcode (Swift 6), and network
 # for the locked npm and SwiftPM dependencies. See native/serve-sim/PROVENANCE.md.

@@ -168,6 +168,22 @@ describe("replay retention", () => {
     expect(byBytes.events(udid).length).toBeLessThan(203);
     expect(byBytes.status(udid, "a").bytes).toBeLessThanOrEqual(256 * 1024);
   });
+
+  it("accounts for UTF-8 event bytes exactly across log eviction and expiration", () => {
+    let now = 10_000;
+    const replay = recorder({ now: () => now, maxBytes: 600 });
+    const eventBytes = () => replay.events(udid).reduce((bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event)), 0);
+    replay.record(udid, { kind: "input", actor: "human", label: "Keep 👋" });
+    for (let i = 0; i < 20; i++) replay.record(udid, { kind: "log", actor: "system", label: `事件 ${i}`, detail: "é".repeat(100) });
+    expect(replay.events(udid)[0]!.label).toBe("Keep 👋");
+    expect(replay.status(udid, "a").bytes).toBe(eventBytes());
+    expect(eventBytes()).toBeLessThanOrEqual(600);
+    now += 30_001;
+    expect(replay.status(udid, "a").bytes).toBe(0);
+    replay.record(udid, { kind: "control", actor: "system", label: "Fresh" });
+    expect(replay.status(udid, "a").bytes).toBe(eventBytes());
+    expect(replay.events(udid)).toHaveLength(1);
+  });
 });
 
 function transport() {

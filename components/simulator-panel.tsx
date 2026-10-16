@@ -55,11 +55,13 @@ function hidSocketUrl(base: string, udid: string, threadId: string): string {
 }
 
 /** A reconnecting binary WebSocket to the plugin's HID relay for one device. */
-function useHidSocket(url: string | null) {
+function useHidSocket(url: string | null, controlVersion: string) {
   const socketRef = useRef<WebSocket | null>(null);
   const [config, setConfig] = useState<ScreenConfig | null>(null);
   const [connected, setConnected] = useState(false);
 
+  // A new lease invalidates the old relay. Open its replacement immediately;
+  // connection-failure backoff belongs only to the same lease.
   useEffect(() => {
     if (!url) return;
     let disposed = false;
@@ -71,19 +73,21 @@ function useHidSocket(url: string | null) {
       socket.binaryType = "arraybuffer";
       socketRef.current = socket;
       socket.onopen = () => {
+        if (disposed || socketRef.current !== socket) return;
         attempt = 0;
         setConnected(true);
       };
       socket.onmessage = (event) => {
+        if (disposed || socketRef.current !== socket) return;
         if (!(event.data instanceof ArrayBuffer)) return;
         const decoded = decodeHid(new Uint8Array(event.data));
         const next = decoded ? screenConfigFrom(decoded.payload) : null;
         if (next) setConfig(next);
       };
       socket.onclose = () => {
+        if (disposed || socketRef.current !== socket) return;
         setConnected(false);
-        if (socketRef.current === socket) socketRef.current = null;
-        if (disposed) return;
+        socketRef.current = null;
         attempt += 1;
         timer = setTimeout(connect, Math.min(5_000, 400 * attempt));
       };
@@ -97,7 +101,7 @@ function useHidSocket(url: string | null) {
       setConnected(false);
       setConfig(null);
     };
-  }, [url]);
+  }, [url, controlVersion]);
 
   const send = useCallback((opcode: number, payload: unknown) => {
     const socket = socketRef.current;
@@ -181,6 +185,7 @@ function DeviceScreen({
   agentActive,
   inputShadowed,
   inputEnabled,
+  controlVersion,
   onShortcut,
   onConfig,
   onStats,
@@ -194,12 +199,13 @@ function DeviceScreen({
   agentActive: boolean;
   inputShadowed: boolean;
   inputEnabled: boolean;
+  controlVersion: string;
   onShortcut: (shortcut: Shortcut) => void;
   onConfig: (config: ScreenConfig | null) => void;
   onStats: (stats: VideoStats | null) => void;
   onPasteText: (text: string) => void;
 }) {
-  const { send: sendHid, config, connected } = useHidSocket(hidSocketUrl(base, udid, threadId));
+  const { send: sendHid, config, connected } = useHidSocket(hidSocketUrl(base, udid, threadId), controlVersion);
   const send = useCallback((opcode: number, payload: unknown) => {
     if (inputEnabled) sendHid(opcode, payload);
   }, [inputEnabled, sendHid]);
@@ -679,6 +685,7 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
   const activeDevice = devices.find((device) => device.udid === activeUdid) ?? null;
   const isAttached = activeUdid !== null && attached.includes(activeUdid);
   const controller = activeUdid ? state?.controls[activeUdid] : undefined;
+  const controlVersion = controller ? `${controller.threadId}:${controller.mode}:${controller.changedAt}` : "unowned";
   const ownsHumanControl = isAttached && controller?.threadId === threadId && controller.mode === "human";
   const canDrive = ownsHumanControl && !replaying && busy !== "control";
   const controlLabel = busy === "control" ? "Changing control…" : !controller ? "View only" : controller.threadId !== threadId
@@ -797,7 +804,7 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
     key={`${activeUdid}:${activeSession.startedAt}`}
     udid={activeUdid} threadId={threadId} session={activeSession} base={base}
     kind={deviceKindFor(activeDevice?.name)} agentActive={agentActive}
-    inputShadowed={inputShadowed} inputEnabled={canDrive}
+    inputShadowed={inputShadowed} inputEnabled={canDrive} controlVersion={controlVersion}
     onShortcut={onShortcut} onConfig={setScreen} onStats={setVideoStats}
     onPasteText={(text) => {
       if (canDrive) rpc.call("pasteText", { threadId, udid: activeUdid, text }).catch((cause) => toast.error(describe(cause)));

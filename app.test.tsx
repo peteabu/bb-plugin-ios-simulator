@@ -30,7 +30,7 @@ const STATE = {
 };
 
 describe("iOS Simulator app", () => {
-  afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+  afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
   it("registers the panel action, overlay, and consent form", async () => {
     const app = await loadPluginApp(() => import("./app"));
@@ -280,6 +280,78 @@ describe("iOS Simulator app", () => {
     expect(slot.inspection.rpcCalls).toContainEqual({ method: "control", input: { threadId: "thr_1", udid: "AAAA-2", mode: "agent" } });
     expect(sockets[0]).toContain("threadId=thr_1");
     slot.lifecycle.unmount();
+  });
+
+  it("reconnects input immediately for a new lease and ignores callbacks from its old socket", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const sockets: Socket[] = [];
+    class Socket {
+      static OPEN = 1;
+      readyState = 1;
+      onopen: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      onmessage: ((event: { data: ArrayBuffer }) => void) | null = null;
+      send = vi.fn();
+      close = vi.fn();
+      constructor() { sockets.push(this); }
+    }
+    vi.stubGlobal("WebSocket", Socket);
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => null })));
+    vi.spyOn(videoStream, "webCodecsAvailable").mockReturnValue(true);
+    vi.spyOn(videoStream, "startVideoStream").mockImplementation((_url, _canvas, callbacks) => {
+      callbacks.onSize?.(300, 600);
+      callbacks.onFirstFrame?.();
+      return { stop() {} };
+    });
+    let controller = { threadId: "thr_1", mode: "agent", changedAt: 1 };
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
+      rpc: { timeline: () => [], replayState: () => REPLAY_STATUS,
+        state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] },
+          controls: { "AAAA-2": controller }, attached: ["AAAA-2"],
+          sessions: [{ udid: "AAAA-2", port: 1, startedAt: 1 }] }),
+      }, context: { projectId: "p", threadId: "thr_1" },
+    });
+    await slot.findByRole("application");
+    await waitFor(() => expect(sockets).toHaveLength(1));
+    await act(async () => sockets[0]!.onopen?.());
+    expect(slot.queryByText("Reconnecting input…")).toBeNull();
+
+    vi.useFakeTimers();
+    await act(async () => sockets[0]!.onclose?.());
+    expect(slot.getByText("Reconnecting input…")).toBeTruthy();
+    controller = { threadId: "thr_1", mode: "human", changedAt: 2 };
+    await act(async () => { await slot.behavior.emitRealtime("control-changed", {}); });
+    // No clock advance: ownership change must bypass the old 400 ms retry.
+    expect(sockets).toHaveLength(2);
+    await act(async () => {
+      sockets[1]!.onopen?.();
+      sockets[1]!.onmessage?.({ data: encodeHid(0, { width: 300, height: 600, orientation: "portrait" }).buffer as ArrayBuffer });
+    });
+    fireEvent.click(slot.getByRole("button", { name: "Device options" }));
+    expect(slot.getByText("300 × 600")).toBeTruthy();
+    await act(async () => {
+      sockets[0]!.onclose?.();
+      sockets[0]!.onmessage?.({ data: encodeHid(0, { width: 999, height: 999, orientation: "landscape_right" }).buffer as ArrayBuffer });
+      sockets[0]!.onopen?.();
+      await vi.advanceTimersByTimeAsync(400);
+    });
+    expect(sockets).toHaveLength(2);
+    expect(slot.queryByText("Reconnecting input…")).toBeNull();
+    expect(slot.getByText("300 × 600")).toBeTruthy();
+
+    // An actual connection failure under the same lease still backs off.
+    await act(async () => {
+      sockets[1]!.onclose?.();
+      await vi.advanceTimersByTimeAsync(399);
+    });
+    expect(sockets).toHaveLength(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(sockets).toHaveLength(3);
+    await act(async () => sockets[2]!.onclose?.());
+    slot.lifecycle.unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+    expect(sockets).toHaveLength(3);
   });
 
   it("isolates replay from live input even while this human owns the device", async () => {

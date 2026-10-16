@@ -35,6 +35,7 @@ export interface ReplayOptions {
   readReport?: (filename: string) => Promise<string>;
 }
 interface Frame { at: number; key: boolean; data: Buffer; config: ScreenConfig | null }
+interface StoredEvent { event: TimelineEvent; bytes: number }
 interface Diagnostics {
   bundleId: string; pid: number | null; child: ChildProcess | null; watcher: ReportsWatcher | null;
   logs: string; crashes: string; seen: Set<string>; reading: boolean;
@@ -45,7 +46,7 @@ interface Session {
   retry: Timer | null; configTimer: Timer | null; reader: ReadableStreamDefaultReader<Uint8Array> | null;
   recording: boolean; error: string | null; description: Buffer | null; pending: Uint8Array;
   frames: Frame[]; awaitingKeyframe: boolean; config: ScreenConfig | null;
-  timeline: TimelineEvent[]; eventBytes: number; diagnostics: Diagnostics | null;
+  timeline: StoredEvent[]; eventBytes: number; diagnostics: Diagnostics | null;
 }
 const bounded = (text: string, length = MAX_LINE) => text.replace(/\0/g, "").slice(0, length);
 const capped = (value: number | undefined, maximum: number, minimum = 1) => Math.max(minimum, Math.min(maximum, Math.floor(value ?? maximum)));
@@ -218,27 +219,30 @@ export class ReplayRecorder {
   record(udid: string, event: NewEvent): void {
     if (this.disposed) return;
     const s = this.session(udid);
-    s.timeline.push({ id: randomUUID(), at: event.at ?? this.now(), kind: event.kind, actor: event.actor,
-      label: bounded(event.label, 240), ...(event.detail ? { detail: bounded(event.detail) } : {}), ...(event.threadId ? { threadId: event.threadId } : {}) });
+    const stored: TimelineEvent = { id: randomUUID(), at: event.at ?? this.now(), kind: event.kind, actor: event.actor,
+      label: bounded(event.label, 240), ...(event.detail ? { detail: bounded(event.detail) } : {}), ...(event.threadId ? { threadId: event.threadId } : {}) };
+    // Events are immutable internally. Serialize once, rather than serializing
+    // every retained line again for each incoming app log or status request.
+    s.timeline.push({ event: stored, bytes: Buffer.byteLength(JSON.stringify(stored)) });
     this.trimEvents(s);
     this.trimFrames(s, s.pending.byteLength);
   }
   private trimEvents(s: Session): void {
     const cutoff = this.now() - REPLAY_LIMITS.windowMs;
-    s.timeline = s.timeline.filter(e => e.at >= cutoff);
-    let bytes = s.timeline.reduce((n, e) => n + Buffer.byteLength(JSON.stringify(e)), 0);
+    s.timeline = s.timeline.filter(({ event }) => event.at >= cutoff);
+    let bytes = s.timeline.reduce((n, item) => n + item.bytes, 0);
     while ((s.timeline.length > this.maxEvents || bytes > Math.min(EVENT_BYTES, this.maxBytes)) && s.timeline.length) {
       // Framework log bursts must not displace the actions and failures that
       // explain the replay. Once only those remain, evict the oldest normally.
-      const logIndex = s.timeline.findIndex(event => event.kind === "log");
+      const logIndex = s.timeline.findIndex(({ event }) => event.kind === "log");
       const [removed] = s.timeline.splice(logIndex < 0 ? 0 : logIndex, 1);
-      bytes -= Buffer.byteLength(JSON.stringify(removed!));
+      bytes -= removed!.bytes;
     }
     s.eventBytes = bytes;
   }
   events(udid: string): TimelineEvent[] {
     const s = this.sessions.get(udid); if (!s) return [];
-    this.trimEvents(s); return s.timeline.map(e => ({ ...e }));
+    this.trimEvents(s); return s.timeline.map(({ event }) => ({ ...event }));
   }
   status(udid: string, threadId: string): ReplayStatus {
     const s = this.sessions.get(udid);
@@ -258,7 +262,7 @@ export class ReplayRecorder {
     if (endAt < startAt) throw new Error("No replay frames are available from the last 30 seconds.");
     const clip: ReplayClip = { id: randomUUID(), udid, threadId, createdAt: this.now(), startAt, endAt, frameCount: s.frames.length,
       description: s.description.toString("base64"), frames: s.frames.map(f => ({ at: f.at, key: f.key, data: f.data.toString("base64"), config: f.config ? { ...f.config } : null })),
-      events: s.timeline.filter(e => e.at >= startAt && e.at <= endAt && (!e.threadId || e.threadId === threadId)).map(e => ({ ...e })) };
+      events: s.timeline.filter(({ event: e }) => e.at >= startAt && e.at <= endAt && (!e.threadId || e.threadId === threadId)).map(({ event }) => ({ ...event })) };
     const bytes = Buffer.byteLength(JSON.stringify(clip));
     if (bytes > this.maxClipBytes) throw new Error("Replay snapshot exceeds the saved-clip byte limit.");
     this.clips.set(clip.id, { clip, bytes });

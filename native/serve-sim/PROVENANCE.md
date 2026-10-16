@@ -12,11 +12,27 @@ The native source was copied from the published `serve-sim@0.1.48` npm tarball:
 - npm integrity: `sha512-Kfg++zbtrRHYEOGAVk/9ftZamp40Qpz8WgP3idWaHoGaCJ01TrEZeq0UnWIsrGSaGhGgi0ytxMOsrEo3H/bFiA==`
 
 The tarball SHA-1 and source differences were checked on 2026-10-16. All
-vendored Swift source, tests, `Package.swift`, and the upstream `build.sh`
-match the published package except `Sources/SimNative/FrameCapture.swift`.
-That file adds a framebuffer change-counter poll for headless simulator
-capture, controlled by `SERVE_SIM_POLL_MS` (8 ms by default), and carries a
-prominent modification notice.
+vendored Swift source, `Package.swift`, and the upstream `build.sh` match the
+published package except these plugin capture changes:
+
+- `Sources/SimNative/FrameCapture.swift` adds a framebuffer change-counter poll
+  for headless capture, controlled by `SERVE_SIM_POLL_MS` (8 ms by default).
+- `Sources/SimNative/CaptureEngine.swift` shares one AVCC encoder between all
+  subscribers, with a plugin-authored `SimNativeSupport/AVCCBroadcast.swift`
+  and its focused tests. Each decoder has an independent ordered delivery
+  queue and resumes with cached configuration plus a fresh keyframe after
+  joining or dropping queued dependencies. Keyframe requests are coalesced at
+  250 ms and survive an encode already in flight. Last unsubscribe clears
+  queues, request tasks and encoder references; retained unsubscribe closures
+  do not retain the old encoder.
+
+Both modified upstream capture files carry prominent modification notices.
+Normal per-subscriber retention, including configuration and an in-flight
+packet, is bounded by eight packets and 2 MiB. A valid larger keyframe may be
+the sole retained packet up to a 64 MiB hard packet ceiling, so large displays
+do not continually request an IDR they cannot deliver. A backpressured client
+requests its next IDR after its current send completes. An in-flight callback
+that ignores cancellation may finish; queued callbacks are discarded.
 
 The Apache-2.0 license is copied verbatim from the repository at that exact
 commit because the npm tarball omits it. It retains Evan Bacon's copyright
@@ -51,6 +67,24 @@ Keep the resulting `.node` file in Git so a public Git install does not need
 to build Swift. Rebuilding may change binary hashes when toolchains or build
 paths change; this records the source and dependency inputs, not a guarantee
 of byte-for-byte reproducibility across Macs.
+
+The distributed arm64 module built on 2026-10-16 passed strict code-signature
+verification. Its SHA-256 is
+`9bdeaa409a7e4b15639175979f53edcb32c708775f62c0ffefc9b7be655fc709`.
+
+The 2026-10-16 shared-encoder build passed all 26 `SimNativeSupportTests`,
+including fanout, codec changes, independent backpressure, oversize handling,
+keyframe request generations, and unsubscribe/stop cleanup. A separate
+generated-pixel harness compiled the actual `CaptureEngine`, `H264Encoder`
+and delivery sources with only `FrameCapture` replaced by a synthetic source
+and encoder counters added. Two subscribers used one encoder and received
+identical bytes; two independent VideoToolbox decoders decoded 25 frames
+each with no errors and matching pixel samples. It also verified encoder
+invalidation after last unsubscribe with old unsubscribe closures retained,
+zero encoding without subscribers, and eight valid frames after a new
+subscription. Input was paced by observed output with explicit timeouts:
+this establishes stream correctness and lifecycle behavior, not live FPS or
+latency. No simulator or running app was accessed by that harness.
 
 ## Runtime installation
 
