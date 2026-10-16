@@ -5,6 +5,11 @@ make ownership understandable at a glance, and keep primary controls easy to
 reach in narrow side panels. Preserve control policy and recording behavior.
 
 - Combine device identity, connection and ownership into one compact header.
+- The open device picker must match that header. Use a bounded, scrollable
+  list grouped by attachment, with readable device/runtime labels and a
+  selected indicator; unavailable rows cannot be selected. Preserve keyboard
+  selection, typeahead, Escape/Tab dismissal, focus visibility and outside-click
+  dismissal.
 - Use a quiet platform switch and one replay toolbar. Put app diagnostics,
   recording details and event output in an initially closed activity drawer
   below the device stage.
@@ -40,3 +45,11 @@ that separate verification without resolving the block.
   layout and interaction, not native BB integration or live stream performance.
   Screenshots and results are outside the source repository under
   `verification/polish-review/` in the workspace.
+
+The follow-up device-picker review adds four browser cases: dark/light at
+440px, narrow at 320px, and a 320×320 short-panel stress case. The popup fits
+the panel, scrolls to keyboard-selected rows, retains trigger focus and closes
+with Escape or outside input. These checks use the same isolated component
+fixture; native BB inspection remains pending.
+The complete suite after this follow-up passes 196 tests across 21 files,
+TypeScript, plugin build and diff checks.

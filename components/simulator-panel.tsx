@@ -35,8 +35,8 @@ import { BEZEL_ASSET_VERSION, fitBezel, isDeviceBezel, type DeviceBezel } from "
 import { displayPointToRaw, screenGeometry } from "@/lib/screen-geometry";
 import { startVideoStream, webCodecsAvailable, type VideoStats } from "@/components/video-stream";
 import { ReplayPanel } from "@/components/replay-panel";
+import { DevicePicker } from "@/components/device-picker";
 
-type Device = SimulatorState["devices"][number];
 type Session = SimulatorState["sessions"][number];
 
 const AGENT_BADGE_MS = 2_500;
@@ -613,10 +613,6 @@ function DeviceOptions({ children }: { children: ReactNode }) {
   </div>;
 }
 
-function deviceLabel(device: Device): string {
-  return `${device.name} · ${device.runtime}${device.state === "Booted" ? " · booted" : ""}`;
-}
-
 export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
   const rpc = useRpc<typeof rpcContract>();
   const pluginId = usePluginId();
@@ -809,48 +805,19 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
   /> : null;
 
   return (
-    <div className="simulator-panel @container flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground antialiased tabular-nums">
+    <div className="simulator-panel @container flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground antialiased tabular-nums" style={{ containerType: "size" }}>
       <div className="simulator-header flex shrink-0 items-center gap-2 border-b border-border/60 px-3 py-2">
-        <div className="relative flex min-h-10 min-w-0 flex-1 items-center gap-2 rounded-lg px-1 transition-colors duration-150 hover:bg-muted/60 focus-within:ring-1 focus-within:ring-ring motion-reduce:transition-none">
+        <DevicePicker devices={devices} attached={attached} value={activeUdid} onChange={setSelected} disabled={devices.length === 0}>
           <Icon name="Smartphone" className="hidden size-4 shrink-0 text-muted-foreground @[360px]:block" />
-          <div className="min-w-0 flex-1 py-0.5">
-            <p className="truncate text-xs font-medium">{activeDevice?.name ?? (state ? "Select a device" : "Loading devices…")}</p>
-            <div className="mt-0.5 flex min-w-0 items-center gap-1.5 truncate text-[11px] text-muted-foreground">
+          <span className="min-w-0 flex-1 py-0.5">
+            <span className="block truncate text-xs font-medium">{activeDevice?.name ?? (state ? "Select a device" : "Loading devices…")}</span>
+            <span className="mt-0.5 flex min-w-0 items-center gap-1.5 truncate text-[11px] text-muted-foreground">
               {isAttached ? <span aria-hidden="true" className={cn("size-1.5 shrink-0 rounded-full", ownsHumanControl ? "bg-emerald-500" : "bg-muted-foreground/60")} /> : null}
               <span role="status" title={isAttached ? controlLabel : undefined} className="truncate">{isAttached ? controlLabel : activeDevice?.runtime ?? "iOS Simulator"}</span>
-            </div>
-          </div>
+            </span>
+          </span>
           <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5 shrink-0 text-muted-foreground" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="m5 6 3 3 3-3" strokeLinecap="round" strokeLinejoin="round" /></svg>
-        <select
-          aria-label="Simulator device"
-          className="absolute inset-0 h-full w-full cursor-pointer opacity-0 disabled:cursor-default"
-          value={activeUdid ?? ""}
-          onChange={(event) => setSelected(event.target.value || null)}
-          disabled={devices.length === 0}
-        >
-          {devices.length === 0 ? <option value="">No simulators found</option> : null}
-          {attached.length > 0 ? (
-            <optgroup label="Attached to this thread">
-              {devices
-                .filter((device) => attached.includes(device.udid))
-                .map((device) => (
-                  <option key={device.udid} value={device.udid}>
-                    {deviceLabel(device)}
-                  </option>
-                ))}
-            </optgroup>
-          ) : null}
-          <optgroup label="Available">
-            {devices
-              .filter((device) => device.isAvailable && !attached.includes(device.udid))
-              .map((device) => (
-                <option key={device.udid} value={device.udid}>
-                  {deviceLabel(device)}
-                </option>
-              ))}
-          </optgroup>
-        </select>
-        </div>
+        </DevicePicker>
         {isAttached && activeSession ? <span title={ownsHumanControl && state?.agentControl === "never" ? "Agent control is turned off in plugin settings" : undefined}>
           <Button size="sm" variant={ownsHumanControl ? "ghost" : "secondary"}
             className="h-10 shrink-0 rounded-lg px-3 transition-[background-color,color,transform] duration-150 active:scale-[0.96] motion-reduce:transition-none"

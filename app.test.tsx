@@ -59,6 +59,7 @@ describe("iOS Simulator app", () => {
       { rpc: { timeline: () => [], replayState: () => REPLAY_STATUS, state: () => STATE }, context: { projectId: "p", threadId: "thr_1" } },
     );
     await slot.findByText(/Node\.js 20 or newer/);
+    fireEvent.click(slot.getByRole("combobox", { name: "Simulator device" }));
     expect(slot.getByRole("option", { name: /iPhone 17 Pro/ })).toBeTruthy();
     expect(slot.getByRole("button", { name: /Attach/ })).toBeTruthy();
     expect(slot.inspection.rpcCalls[0]).toMatchObject({ method: "state" });
@@ -72,16 +73,17 @@ describe("iOS Simulator app", () => {
       rpc: { timeline: () => [], replayState: () => REPLAY_STATUS, state: () => ({ ...STATE, attached }) },
       context: { projectId: "p", threadId: "thr_1" },
     });
-    const select = await slot.findByRole<HTMLSelectElement>("combobox", { name: "Simulator device" });
-    await waitFor(() => expect(select.value).toBe("AAAA-2"));
+    const select = await slot.findByRole("combobox", { name: "Simulator device" });
+    await slot.findByText("iPhone 17", { exact: true });
     attached = ["AAAA-1", "AAAA-2"];
     await slot.behavior.emitRealtime("attached", { threadId: "thr_1", udid: "AAAA-1" });
-    await waitFor(() => expect(select.value).toBe("AAAA-1"));
-    fireEvent.change(select, { target: { value: "AAAA-2" } });
+    await slot.findByText("iPhone 17 Pro", { exact: true });
+    fireEvent.click(select);
+    fireEvent.click(slot.getByRole("option", { name: /^iPhone 17(?! Pro)/ }));
     await slot.behavior.emitRealtime("attached", { threadId: "thr_1", udid: "AAAA-1" });
-    await waitFor(() => expect(select.value).toBe("AAAA-1"));
+    await slot.findByText("iPhone 17 Pro", { exact: true });
     await slot.behavior.emitRealtime("attached", { threadId: "thr_other", udid: "AAAA-2" });
-    expect(select.value).toBe("AAAA-1");
+    expect(slot.getByText("iPhone 17 Pro", { exact: true })).toBeTruthy();
     slot.lifecycle.unmount();
   });
 
@@ -91,13 +93,14 @@ describe("iOS Simulator app", () => {
     const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
       rpc: { timeline: () => [], replayState: () => REPLAY_STATUS, state }, context: { projectId: "p", threadId: "thr_1" },
     });
-    const select = await slot.findByRole<HTMLSelectElement>("combobox", { name: "Simulator device" });
-    await waitFor(() => expect(select.value).toBe("AAAA-1"));
-    fireEvent.change(select, { target: { value: "AAAA-2" } });
+    const select = await slot.findByRole("combobox", { name: "Simulator device" });
+    await slot.findByText("iPhone 17 Pro", { exact: true });
+    fireEvent.click(select);
+    fireEvent.click(slot.getByRole("option", { name: /^iPhone 17(?! Pro)/ }));
     const before = state.mock.calls.length;
     await slot.behavior.emitRealtime("sessions-changed", {});
     await waitFor(() => expect(state.mock.calls.length).toBeGreaterThan(before));
-    expect(select.value).toBe("AAAA-2");
+    expect(slot.getByText("iPhone 17", { exact: true })).toBeTruthy();
     slot.lifecycle.unmount();
   });
 
@@ -325,8 +328,10 @@ describe("iOS Simulator app", () => {
           sessions: [{ udid: "AAAA-2", port: 1, startedAt: 1 }, { udid: "AAAA-1", port: 2, startedAt: 1 }] }),
       }, context: { projectId: "p", threadId: "thr_1" },
     });
-    const select = await slot.findByRole("combobox", { name: "Simulator device" });
-    fireEvent.change(select, { target: { value: "AAAA-1" } });
+    await slot.findByRole("application");
+    const select = slot.getByRole("combobox", { name: "Simulator device" });
+    fireEvent.click(select);
+    fireEvent.click(slot.getByRole("option", { name: /iPhone 17 Pro/ }));
     await slot.findByRole("button", { name: "Attach", exact: true });
     expect(slot.queryByRole("button", { name: "Take control" })).toBeNull();
     expect(slot.queryByRole("button", { name: "Let agent drive" })).toBeNull();
