@@ -201,7 +201,7 @@ export class SimulatorService {
   async attach(
     threadId: string,
     query: string | null | undefined,
-    options: { allowDefault?: boolean; signal?: AbortSignal } = {},
+    options: { allowDefault?: boolean; select?: boolean; signal?: AbortSignal } = {},
   ): Promise<AttachResult> {
     const device = await this.resolveDevice(threadId, query, options);
     let booted = false;
@@ -217,9 +217,11 @@ export class SimulatorService {
     const set = this.attachments.get(threadId) ?? new Set<string>();
     const isNew = !set.has(device.udid);
     set.add(device.udid);
-    this.attachments.set(threadId, set);
+    // An explicit Attach also chooses the default for subsequent tool calls.
+    // Keeping that device first reuses the persisted attachment order.
+    this.attachments.set(threadId, options.select ? new Set([device.udid, ...set]) : set);
     await this.persist();
-    if (isNew || booted) {
+    if (isNew || booted || options.select) {
       this.options.publish(CHANNELS.attached, { threadId, udid: device.udid, name: device.name });
     }
     this.options.publish(CHANNELS.sessions, { udid: device.udid });

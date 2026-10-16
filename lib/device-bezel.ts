@@ -1,4 +1,6 @@
 // Geometry only. Apple artwork stays in the host's DeviceKit installation.
+import type { Rotation } from "./screen-geometry";
+
 export const BEZEL_PARTS = [
   "topLeft", "top", "topRight", "right", "bottomRight", "bottom", "bottomLeft", "left",
 ] as const;
@@ -32,16 +34,14 @@ export function isDeviceBezel(value: unknown): value is DeviceBezel {
       && positive(layer.width) && positive(layer.height));
 }
 
-/** Keep the video upright while rotating the artwork to match the device. */
+/** Rotate the native artwork and its screen opening together. */
 export function fitBezel(
   box: { width: number; height: number },
   bezel: DeviceBezel,
-  orientation: string | undefined,
-  landscape: boolean,
+  angle: Rotation,
   padding = 16,
 ) {
-  const angle = landscape ? (orientation === "landscape_left" ? 270 : 90)
-    : orientation === "portrait_upside_down" ? 180 : 0;
+  const landscape = angle === 90 || angle === 270;
   const width = landscape ? bezel.height : bezel.width;
   const height = landscape ? bezel.width : bezel.height;
   const scale = Math.max(0, Math.min((box.width - padding * 2) / width, (box.height - padding * 2) / height));

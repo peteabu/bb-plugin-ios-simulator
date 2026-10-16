@@ -130,6 +130,35 @@ describe("Android plugin integration", () => {
 });
 
 describe("Android screenshot lifecycle", () => {
+  it("keeps a concurrent agent screenshot running when the panel caller aborts", async () => {
+    const sdk = fakeSdk();
+    let finish!: (bytes: { stdout: Buffer; stderr: string; code: number }) => void;
+    let captureSignal: AbortSignal | undefined;
+    const capture = vi.fn<AndroidExec>(async (_file, _args, options) => {
+      captureSignal = options?.signal;
+      return new Promise((resolve, reject) => {
+        finish = resolve;
+        options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
+      });
+    });
+    const exec: AndroidExec = (file, args, options) => args.includes("screencap") ? capture(file, args, options) : sdk.exec(file, args, options);
+    const service = new AndroidService({ ...sdk, exec, publish: () => {} });
+    await service.attach("thr_1", { id: "emulator-5554", name: "Pixel", serial: "emulator-5554", state: "Booted" });
+    const panelController = new AbortController(), agentController = new AbortController();
+    const panel = service.screenshot("thr_1", "emulator-5554", panelController.signal).catch((error) => error);
+    const agent = service.screenshot("thr_1", "emulator-5554", agentController.signal);
+    expect(capture).toHaveBeenCalledTimes(1);
+    panelController.abort();
+    expect(await panel).toBe(panelController.signal.reason);
+    expect(captureSignal?.aborted).toBe(false);
+    const png = androidPng();
+    finish({ stdout: png, stderr: "", code: 0 });
+    expect(await agent).toEqual(png);
+    expect(agentController.signal.aborted).toBe(false);
+    expect(capture).toHaveBeenCalledTimes(1);
+    await service.dispose();
+  });
+
   it("coalesces concurrent screenshots into one adb process and aborts it on dispose", async () => {
     const sdk = fakeSdk();
     let finish!: (bytes: { stdout: Buffer; stderr: string; code: number }) => void;

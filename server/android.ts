@@ -174,14 +174,25 @@ export class AndroidService {
   }
   async screenshot(threadId: string, serial: string, signal?: AbortSignal): Promise<Buffer> {
     this.assertAttached(threadId, serial);
+    signal?.throwIfAborted();
     // HTTP preview polling, downloads, and agent screenshots share one capture.
     let pending = this.screenshots.get(serial);
     if (!pending) {
-      pending = this.adb.screenshot(serial, this.signal(signal));
+      pending = this.adb.screenshot(serial, this.signal());
       this.screenshots.set(serial, pending);
       void pending.finally(() => this.screenshots.delete(serial)).catch(() => undefined);
     }
-    return pending;
+    if (!signal) return pending;
+    // Closing one panel cancels its wait, not another caller's shared capture.
+    return new Promise((resolve, reject) => {
+      const abort = () => {
+        signal.removeEventListener("abort", abort);
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      pending.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+      if (signal.aborted) abort();
+    });
   }
   async detach(threadId: string, serial: string, shutdown: boolean, signal?: AbortSignal) {
     this.assertAttached(threadId, serial);

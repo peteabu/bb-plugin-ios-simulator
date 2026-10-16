@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { deviceKindFor, fitDevice, shortcutFor } from "./components/simulator-panel";
 import { BEZEL_PARTS, fitBezel, type DeviceBezel } from "./lib/device-bezel";
+import { decodeHid, encodeHid, HID } from "./lib/sim-protocol";
+import * as videoStream from "./components/video-stream";
 
 const STATE = {
   ready: { ok: false, problems: ["Node.js 20 or newer was not found on PATH."], xcode: "/x", node: null, serveSim: "/s" },
@@ -21,7 +23,7 @@ const STATE = {
 };
 
 describe("iOS Simulator app", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
   it("registers the panel action, overlay, and consent form", async () => {
     const app = await loadPluginApp(() => import("./app"));
@@ -56,6 +58,54 @@ describe("iOS Simulator app", () => {
     slot.lifecycle.unmount();
   });
 
+  it("selects the newly attached device and reselects it on explicit reattach", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    let attached = ["AAAA-2"];
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
+      rpc: { state: () => ({ ...STATE, attached }) },
+      context: { projectId: "p", threadId: "thr_1" },
+    });
+    const select = await slot.findByRole<HTMLSelectElement>("combobox", { name: "Simulator device" });
+    await waitFor(() => expect(select.value).toBe("AAAA-2"));
+    attached = ["AAAA-1", "AAAA-2"];
+    await slot.behavior.emitRealtime("attached", { threadId: "thr_1", udid: "AAAA-1" });
+    await waitFor(() => expect(select.value).toBe("AAAA-1"));
+    fireEvent.change(select, { target: { value: "AAAA-2" } });
+    await slot.behavior.emitRealtime("attached", { threadId: "thr_1", udid: "AAAA-1" });
+    await waitFor(() => expect(select.value).toBe("AAAA-1"));
+    await slot.behavior.emitRealtime("attached", { threadId: "thr_other", udid: "AAAA-2" });
+    expect(select.value).toBe("AAAA-1");
+    slot.lifecycle.unmount();
+  });
+
+  it("uses the promoted default on mount and preserves manual choice during refresh", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const state = vi.fn(() => ({ ...STATE, attached: ["AAAA-1", "AAAA-2"] }));
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
+      rpc: { state }, context: { projectId: "p", threadId: "thr_1" },
+    });
+    const select = await slot.findByRole<HTMLSelectElement>("combobox", { name: "Simulator device" });
+    await waitFor(() => expect(select.value).toBe("AAAA-1"));
+    fireEvent.change(select, { target: { value: "AAAA-2" } });
+    const before = state.mock.calls.length;
+    await slot.behavior.emitRealtime("sessions-changed", {});
+    await waitFor(() => expect(state.mock.calls.length).toBeGreaterThan(before));
+    expect(select.value).toBe("AAAA-2");
+    slot.lifecycle.unmount();
+  });
+
+  it("opens the same panel action on attach without creating a device-specific tab", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.appOverlays[0]!, {}, { context: { projectId: "p", threadId: "thr_1" } });
+    await slot.behavior.emitRealtime("attached", { threadId: "thr_1", udid: "AAAA-1" });
+    await slot.behavior.emitRealtime("attached", { threadId: "thr_1", udid: "AAAA-2" });
+    expect(slot.inspection.navigateCalls).toEqual([
+      { method: "openThreadPanel", options: { actionId: "simulator" } },
+      { method: "openThreadPanel", options: { actionId: "simulator" } },
+    ]);
+    slot.lifecycle.unmount();
+  });
+
   it("fits a bezelled device inside the available box", () => {
     const tall = fitDevice({ width: 400, height: 900 }, 9 / 19.5, "phone");
     expect(tall.frameHeight).toBeLessThanOrEqual(900 - 32 + 0.01);
@@ -63,6 +113,10 @@ describe("iOS Simulator app", () => {
     expect(tall.screenWidth / tall.screenHeight).toBeCloseTo(9 / 19.5, 5);
     const wide = fitDevice({ width: 300, height: 900 }, 9 / 19.5, "phone");
     expect(wide.frameWidth).toBeCloseTo(300 - 32, 3);
+    const landscape = fitDevice({ width: 900, height: 400 }, 19.5 / 9, "phone");
+    expect(landscape.frameWidth).toBeLessThanOrEqual(868);
+    expect(landscape.frameHeight).toBeLessThanOrEqual(368);
+    expect(landscape.screenRadius).toBeCloseTo(tall.screenRadius);
     expect(deviceKindFor("iPad Pro 13-inch (M5)")).toBe("tablet");
     expect(deviceKindFor("iPhone 17 Pro")).toBe("phone");
   });
@@ -73,14 +127,81 @@ describe("iOS Simulator app", () => {
       screen: { x: 18, y: 18, width: 402, height: 874, cornerRadius: 62 },
       layers: BEZEL_PARTS.map((id) => ({ id, x: 0, y: 0, width: 1, height: 1 })),
     };
-    const upright = fitBezel({ width: 500, height: 1000 }, frame, "portrait", false);
+    const upright = fitBezel({ width: 500, height: 1000 }, frame, 0);
     expect(upright.screenWidth / upright.screenHeight).toBeCloseTo(402 / 874);
     expect(upright.frameHeight).toBeLessThanOrEqual(968);
-    const landscape = fitBezel({ width: 800, height: 500 }, frame, "landscape_left", true);
-    expect(landscape.angle).toBe(270);
+    const landscape = fitBezel({ width: 800, height: 500 }, frame, 90);
+    expect(landscape.angle).toBe(90);
     expect(landscape.screenWidth / landscape.screenHeight).toBeCloseTo(874 / 402);
     expect(landscape.screenX + landscape.screenWidth).toBeLessThan(landscape.frameWidth);
     expect(landscape.screenY + landscape.screenHeight).toBeLessThan(landscape.frameHeight);
+  });
+
+  it.each([
+    { mode: "mjpeg", frame: "xcode", rawLandscape: false },
+    { mode: "video", frame: "xcode", rawLandscape: false },
+    { mode: "mjpeg", frame: "fallback", rawLandscape: false },
+    { mode: "video", frame: "xcode", rawLandscape: true },
+  ])("aligns landscape $mode/$frame and swipe coordinates (raw landscape: $rawLandscape)", async ({ mode, frame, rawLandscape }) => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(800);
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(500);
+    vi.stubGlobal("PointerEvent", MouseEvent);
+    vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1));
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    let socket!: Socket;
+    class Socket {
+      static OPEN = 1;
+      readyState = 1;
+      onmessage: ((event: { data: ArrayBuffer }) => void) | null = null;
+      send = vi.fn();
+      constructor() { socket = this; }
+      close() {}
+    }
+    vi.stubGlobal("WebSocket", Socket);
+    vi.stubGlobal("Image", class {
+      onload: (() => void) | null = null;
+      set src(_value: string) { queueMicrotask(() => this.onload?.()); }
+    });
+    const bezel: DeviceBezel = {
+      source: "xcode", width: 436, height: 908,
+      screen: { x: 17, y: 17, width: 402, height: 874, cornerRadius: 62, mask: true },
+      layers: [{ id: "composite", x: 0, y: 0, width: 436, height: 908 }],
+    };
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => frame === "xcode" ? bezel : null })));
+    vi.spyOn(videoStream, "webCodecsAvailable").mockReturnValue(mode === "video");
+    vi.spyOn(videoStream, "startVideoStream").mockImplementation((_url, _canvas, callbacks) => {
+      callbacks.onSize?.(rawLandscape ? 2622 : 1206, rawLandscape ? 1206 : 2622);
+      return { stop() {} };
+    });
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
+      rpc: { state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] },
+        attached: ["AAAA-2"], sessions: [{ udid: "AAAA-2", port: 1234, startedAt: 1 }] }) },
+      context: { projectId: "p", threadId: "thr_1" },
+    });
+    const surface = await slot.findByRole("application");
+    await waitFor(() => expect(socket).toBeDefined());
+    await act(async () => socket.onmessage?.({ data: encodeHid(0, { width: 1206, height: 2622, orientation: "landscape_right" }).buffer as ArrayBuffer }));
+    const content = surface.querySelector<HTMLCanvasElement | HTMLImageElement>(mode === "video" ? "canvas" : "img")!;
+    await waitFor(() => expect(surface.parentElement?.getAttribute("data-bezel")).toBe(frame));
+    expect(Number.parseFloat(surface.style.width)).toBeGreaterThan(Number.parseFloat(surface.style.height));
+    expect(content.style.transform).toBe(rawLandscape ? "rotate(0deg)" : "rotate(270deg)");
+    expect(content.style.width).toBe(rawLandscape ? surface.style.width : surface.style.height);
+    expect(content.style.height).toBe(rawLandscape ? surface.style.height : surface.style.width);
+    if (frame === "xcode") expect(surface.style.maskImage).toContain("rotation=270");
+    expect((surface.parentElement?.firstElementChild as HTMLElement).style.transform).toBe("rotate(270deg)");
+    surface.setPointerCapture = vi.fn();
+    vi.spyOn(surface, "getBoundingClientRect").mockReturnValue({ left: 10, top: 20, width: 874, height: 402 } as DOMRect);
+    fireEvent.pointerDown(surface, { button: 0, clientX: 10 + 874 * 0.03, clientY: 20 + 402 * 0.35 });
+    fireEvent.pointerMove(surface, { clientX: 10 + 874 * 0.18, clientY: 20 + 402 * 0.6 });
+    fireEvent.pointerUp(surface, { clientX: 10 + 874 * 0.22, clientY: 20 + 402 * 0.7 });
+    expect(socket.send.mock.calls.map(([data]) => decodeHid(data))).toEqual([
+      { opcode: HID.TOUCH, payload: { type: "begin", x: expect.closeTo(rawLandscape ? 0.03 : 0.65), y: expect.closeTo(rawLandscape ? 0.35 : 0.03) } },
+      { opcode: HID.TOUCH, payload: { type: "move", x: expect.closeTo(rawLandscape ? 0.18 : 0.4), y: expect.closeTo(rawLandscape ? 0.6 : 0.18) } },
+      { opcode: HID.TOUCH, payload: { type: "end", x: expect.closeTo(rawLandscape ? 0.22 : 0.3), y: expect.closeTo(rawLandscape ? 0.7 : 0.22) } },
+    ]);
+    slot.lifecycle.unmount();
   });
 
   it("pastes clipboard text into the attached simulator while retaining the fallback frame", async () => {

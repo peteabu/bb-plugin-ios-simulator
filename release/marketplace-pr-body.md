@@ -1,35 +1,42 @@
-DRAFT — complete the pending checks and real screenshots before submission.
-
 Adds iOS Simulator: a shared simulator panel beside a BB thread, native agent
 controls, and an initial Android emulator screenshot preview.
 
-Proposed source: https://github.com/peteabu/bb-plugin-ios-simulator.git,
-Git range `^0.1.0`, release tag `v0.1.0`.
+Source: https://github.com/peteabu/bb-plugin-ios-simulator.git,
+Git range `^0.1.0`, immutable release tag `v0.1.0`.
+
+Plugin checks pass: **110 tests across 14 files**, TypeScript, BB plugin
+build, and reload. Native BB Home, Lock, full-cycle toolbar rotation, and
+explicit attachment/default selection pass live checks. Foreground pointer
+actions reach the expected asymmetric targets in portrait and both landscape
+orientations. A 90-second H.264 run decoded **546/546 frames without errors**
+including the Lock transition. Unicode text insertion was verified in Truffle.
+Android caller cancellation preserves a concurrent shared screenshot; live
+Android testing still needs an SDK/AVD.
+
+Marketplace checks pass: current v2 schema, ID/categories, icon/image hashes,
+PNG format/width/size, no orphan screenshots, overview and draft-copy equality,
+full build (384 entries), v1 addition gate, all 43 tests, upload retry tests,
+and whitespace. One unchanged entry has an unrelated missing-category warning.
 
 The plugin requires BB 0.46+/Plugin SDK 0.6.37+. iOS requires an Apple Silicon
 Mac with Xcode, the iOS platform, and Node.js 20+. Android requires an existing
-Android SDK and AVD. It runs local processes for capture/input, proxies the
-panel through BB, and asks for agent control permission by default. No
-additional external account or hosted service is required. The native source
-and compiled helper license/provenance notices are included in the plugin.
+Android SDK and AVD. Local helpers capture and control the device; BB proxies
+the panel and asks for agent control permission by default. No additional
+external account or hosted service is required. Native source/binary licenses
+and provenance are included; Xcode artwork is read locally, not bundled.
 
-Validated locally: current v2 entry schema, plugin ID, categories, vendored
-SVG icon, and overview; full marketplace build (384 entries), v1 addition
-gate, 43 marketplace tests, and upload retry tests. The plugin root reports
-82 passing tests across 12 files, successful TypeScript checking, plugin
-build/reload, and verified Unicode insertion in Truffle on a live iOS 27
-simulator. The proposed source is unpublished (GitHub404), so source liveness cannot
-pass before the approved release. The full source check covering all384
-marketplace entries was stopped; it is not recorded as passed. The approved
-final release commit is pending. Live Android testing is pending an SDK/AVD.
+`screenshots/ios-simulator/panel-eb92b3d6.png` shows the real installed BB panel
+with Truffle's Create conversation/Wikipedia topics, local Apple device frame,
+picker, and footer controls. The reviewed native-window crop is 1472×1600 and
+278,376 bytes, without private chat or paths. It remains accurate after the
+final fixes. The full private window capture is excluded.
 
-Performance was sampled under system load 26–38: static 6.7 fps/21 KiB/s;
-animation 53.1 fps/136 KiB/s, median frame gap 16 ms, 90th percentile 25 ms,
-and two gaps above 120 ms in eight seconds. A requested quiet-host retest has
-not been performed while existing user workers remain busy.
-
-Screenshots: PENDING real installed BB panel/header capture. Do not submit
-without replacing this text and adding its entry references.
+Performance samples were taken under heavy host load. Historical animation
+was 53.1 fps at load 26–38, with two gaps above 120 ms in eight seconds.
+A separate-device run measured 47.7 fps, median gap 17 ms/p90 30 ms, and two
+gaps above 120 ms; idle was 2.5 fps. Host load was about 657 before and 159
+after that run. These do not establish quiet- or normal-host performance;
+the requested quiet-host retest remains unfulfilled.
 
 Overview source: plugin repository `PLUGIN_OVERVIEW.md`, copied unchanged to
 `overview/ios-simulator.md`.

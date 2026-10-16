@@ -290,7 +290,7 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
         };
       },
       async attach({ threadId, device }) {
-        const result = await service.attach(threadId, device, { allowDefault: true });
+        const result = await service.attach(threadId, device, { allowDefault: true, select: true });
         return {
           udid: result.device.udid,
           port: result.session.port,
@@ -478,12 +478,13 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
     async function withDevice(
       ctx: ToolCtx,
       query: string | undefined,
-      options: { allowDefault?: boolean; consent?: boolean; input?: boolean },
+      options: { allowDefault?: boolean; select?: boolean; consent?: boolean; input?: boolean },
       work: (device: SimDevice, booted: boolean) => Promise<ToolResult>,
     ): Promise<ToolResult> {
       try {
         const { device, booted } = await service.attach(ctx.threadId, query, {
           allowDefault: options.allowDefault ?? false,
+          select: options.select,
           signal: ctx.signal,
         });
         if (options.consent !== false) await ensureConsent(ctx.threadId, device, ctx.signal);
@@ -545,7 +546,7 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       presentation: { label: { pending: "Attaching simulator", completed: "Attached simulator" } },
       parameters: z.object({ device: deviceParam }),
       async execute({ device }, ctx) {
-        return withDevice(ctx, device, { allowDefault: true, consent: false }, async (dev, booted) => {
+        return withDevice(ctx, device, { allowDefault: true, select: true, consent: false }, async (dev, booted) => {
           const config = await streams.screenConfig(dev.udid).catch(() => null);
           const shadowed = await service.inputShadowed(dev.udid, ctx.signal).catch(() => false);
           return [
@@ -895,6 +896,7 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
               }
               const result = await service.attach(threadId, input.positionals.device ?? null, {
                 allowDefault: true,
+                select: true,
                 signal: ctx.signal,
               });
               const summary = { udid: result.device.udid, name: result.device.name, port: result.session.port };

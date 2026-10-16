@@ -2,89 +2,111 @@
 
 ## Plugin checks
 
-- TypeScript passes. All 94 tests across 13 files pass, including native-version
-  guards, consent, device ownership, input cancellation, clipboard failure,
-  concurrent text, Android boot identity, and UI geometry/controls.
-- `bb plugin build` succeeds. The path-installed plugin reloads and restores
-  the attached iOS stream.
-- `serve-sim` is pinned to 0.1.48 in both package manifests. The vendored capture
+- All **110 tests across 14 files** pass. Coverage includes stream/decoder
+  disposal, consent, device ownership, clipboard failure and Unicode input,
+  Android lifecycle/cancellation, explicit device selection, all four frame
+  rotations, and pointer mapping with asymmetric geometry.
+- `npm run typecheck`, `npm run build` (`bb plugin build`), and
+  `git diff --check` pass. The path-installed plugin reloads successfully.
+- `serve-sim` is pinned to 0.1.48 in manifest and lockfile. The native capture
   module is installed only into that exact dependency version.
-- Both bundled native binaries were rebuilt, signed, and checked against
-  `native/BUILD_METADATA.json`. Source, build manifests, and license notices
-  are included; build caches and Apple artwork are excluded from Git.
+- Both tracked native binary hashes match `native/BUILD_METADATA.json`.
+  Source, reproduction scripts, provenance, and license notices are included.
+  Build caches and Apple artwork are excluded from Git.
 
-## Real iOS app loop
+## Real iOS app and panel
 
-The existing Truffle project was built with Xcode 27 for the attached iPhone
-simulator using `xcodebuild -project …/Truffle.xcodeproj -scheme Truffle
--destination 'platform=iOS Simulator,id=…' -derivedDataPath … -configuration
-Debug CODE_SIGNING_ALLOWED=NO build`. Build succeeded.
+The existing Truffle project built successfully with Xcode 27 using
+`xcodebuild` and an explicit iOS Simulator destination. The plugin installed
+and launched the app. Taps opened search, and paste inserted “Café 東京”;
+a screenshot showed the query and matching results. The UIKit clipboard
+helper also passed three exact Unicode/multiline/emoji round trips. Clipboard
+writes are read back before Command-V so a silent failed write is an error.
 
-The plugin installed and launched the resulting app. Screenshots showed its
-home screen; coordinate taps opened its search. The plugin's paste RPC inserted
-“Café 東京” into that real field, and a screenshot showed the query and matching
-search results. The UIKit helper also passed three byte-for-byte pasteboard
-round trips containing Unicode, line breaks, tabs, and emoji. Every clipboard
-write is read back before sending Command-V; a silent failed write is an error.
+Native BB window captures through the user-configured Cua Driver confirm the
+real installed panel's portrait frame, picker, stream, and footer controls.
+The marketplace contains only a reviewed panel crop, without private chat or
+paths: `panel-eb92b3d6.png`, 1472×1600, 278,376 bytes. Its portrait appearance
+remains accurate after the final selection/rotation fixes.
 
-The corrected live bezel route returns Apple's 436×908 composite body with a
-402×874 screen at (17,17). The body is rasterized from its vector PDF at 3×
-(1308×2724); the native framebuffer alpha mask is 1206×2622 and is rendered
-separately for all four orientations. This replaces inferred nine-slice sizing,
-72dpi artwork, and a circular CSS screen crop. No Apple artwork is bundled.
+Apple's local DeviceKit artwork provides a 436×908 body and a 402×874 opening
+at (17,17). Vector artwork is rasterized at 3× (1308×2724); the framebuffer
+mask is 1206×2622, with separate masks for four orientations. No Apple artwork
+is bundled. This replaces inferred nine-slice sizing and 72dpi rasterization.
 
-## Frame, toolbar, and viewer follow-up
+Final live checks used a separate iPhone 17 Pro simulator so another thread's
+device was not driven. Explicit attach selected that device in the panel.
+Home and Lock worked through the actual footer buttons. Toolbar rotation
+completed a full cycle and returned to an upright portrait view; both
+landscape directions displayed the matching frame and normalized content.
+Foreground pointer clicks reached distinct page targets in portrait, landscape
+left, and landscape right, verified by both visible feedback and HTTP events.
+The page's Safari orientation policy governs its response to upside-down
+orientation; automated geometry tests cover that physical rotation too.
 
-- Live button RPC response time measured 74.4 ms before and 3.2 ms after the
-  persistent HID connection change. The previous fixed waits were 70 ms per
-  button and 110 ms per rotation. These measurements cover dispatch, not the
-  simulator's animation completion or browser input-to-paint latency.
-- Toolbar controls have pending feedback and keep their layout independent of
-  changing video statistics. Repeated rotations advance from the last requested
-  orientation while the simulator's configuration catches up.
-- The viewer uses composited canvas painting with high-quality scaling. On
-  disconnect it closes its decoder, frame handles, timers, and transport before
-  reconnecting; late frames cannot paint after disposal.
-- Fitness flicker was independently reproduced in 12 `simctl` screenshots as
-  well as 108 MJPEG frames. The Fitness+ card alternates loading placeholders
-  and Content Unavailable before the plugin viewer. Relaunching Fitness still
-  showed a loading error. No native capture modification was justified; the
-  underlying Fitness/Xcode cause remains undetermined.
-- Geometry, raster dimensions, alpha edges, rotation, lifecycle, and controls
-  were checked through native output, HTTP, and the SDK test harness. Native
-  BB-window visual inspection remains blocked by Computer Use approval; no
-  claim is made that its final on-screen appearance was visually verified.
+## Responsiveness and stream lifecycle
 
-## Stream measurement
+- Persistent HID dispatch reduced measured button RPC response from 74.4 ms
+  to 3.2 ms. These numbers measure dispatch, not animation completion or
+  browser input-to-paint latency.
+- Controls show per-button pending feedback. The statistics row has fixed
+  space so changing video statistics do not shift the buttons.
+- Explicit attach promotes and persists the requested default device and
+  selects it in mounted panels. Ordinary operations preserve selection.
+- Raw portrait frames are normalized for landscape display, and pointer
+  begin/move/end coordinates receive the corresponding inverse transform.
+  Already-landscape frames skip the quarter-turn transform.
+- Canvas painting uses high-quality scaling. Disconnect closes the decoder,
+  pending frames, timers, and transport; late frames cannot paint after
+  disposal. No native encoder change was made for an unproven freeze.
+- A 90-second persistent H.264 connection decoded **546/546 frames with zero
+  errors**, including the Lock transition before the next keyframe. A final
+  native BB capture also showed Lock correctly after the toolbar action.
+  The earlier delayed display did not reproduce as a persistent freeze.
+- Android screenshot coalescing now lets a cancelled caller stop its own wait
+  without aborting another caller's shared adb capture. Service disposal still
+  aborts the underlying capture.
 
-A local Safari page synchronized static and animated phases with a temporary
-benchmark server. Samples counted H.264 records delivered by serve-sim; these
-are transport measurements, not BB renderer paint rate or tap latency.
+## Fitness flicker
 
-| Scene | Sample | Frames/s | KiB/s | Median frame gap | 90th percentile |
-| --- | --- | --- | --- | --- | --- |
-| Static page | 6 seconds | 6.7 | 21 | 206 ms | 224 ms |
-| CSS animation | 8 seconds | 53.1 | 136 | 16 ms | 25 ms |
+Flicker appeared in 12 native `simctl` screenshots and 108 MJPEG frames, before
+the plugin viewer. Fitness+ alternated loading placeholders and Content
+Unavailable; relaunching did not resolve it. Read-only logs on iOS 27 build
+24A434 recorded 2,290 `FitnessSampleContent.SampleContentError.noItems` DataFlow
+errors in one minute. This supports an app-side content failure, but does not
+establish the exact cause of the visual flicker. No capture patch is justified
+by that evidence, and no stable-runtime comparison was available.
 
-The animation sample had two gaps over 120 ms. Longer idle gaps are expected
-at the helper's five-frame-per-second idle floor. The Mac's load average was
-26–38, with seven aligner workers consuming most CPU cores. A quiet-machine
-comparison remains pending; unrelated workers were left running.
+## Transport measurements
 
-## Remaining limits
+A local Safari page synchronized static and animated phases. These samples
+count H.264 records delivered by serve-sim; they do not measure BB canvas paint
+rate or input latency.
 
-- Xcode 27's accessibility service returned `noFrontmostApplication` while
-  Truffle was visibly running and touchable. Read-only probes confirmed normal
-  bridge callbacks but empty results for both tested display IDs and client
-  types. The tool reports this and directs agents to screenshot/coordinate
-  controls. Accessibility-based tapping was not verified successfully.
-- No Android SDK or AVD is installed on this host. Android's 17 automated
-  checks pass and the live readiness RPC reports missing tools, but real
-  Android boot/install/input/preview remain unverified. Its preview uses
-  serialized PNG polling at about one frame per second.
-- Computer Use was not approved to access bb. Header/control behavior and frame
-  geometry were verified with the SDK harness and backend, but a native BB
-  screenshot and visual review remain pending. The marketplace draft has no
-  screenshots and must not be submitted in that state.
-- No public repository, release tag, or marketplace pull request has been
-  published. See RELEASE_PLAN.md for the proposed release and approval steps.
+| Run | Static fps / KiB/s | Animation fps / KiB/s | Animation median / p90 gap | Gaps >120 ms |
+| --- | --- | --- | --- | --- |
+| Historical loaded host | 6.7 / 21 | 53.1 / 136 | 16 / 25 ms | 2 in 8 s |
+| Separate-device retest | 2.5 / 17 | 47.7 / 121 | 17 / 30 ms | 2 in 8 s |
+
+Historical host load was 26–38 with seven existing alignment workers. The
+separate-device sample ran at severe host load (about 657 before and 159
+after); it delivered 382 animation frames in eight seconds and 15 static
+frames in 6.01 seconds. A separate 50.5 fps sample on a concurrently used
+device is provisional and excluded from comparisons. The requested quiet-host
+retest remains incomplete. Unrelated user work was left running.
+
+## Remaining limits and release state
+
+- Xcode 27 accessibility returned `noFrontmostApplication` while Truffle was
+  visibly running and touchable. Probes returned empty results for both tested
+  display IDs/client types. Screenshot/coordinate input worked; successful
+  accessibility-based tapping is not claimed.
+- No Android SDK/AVD is installed. Its 18 focused automated checks pass, but
+  real Android boot/install/input/preview are unverified. Preview uses
+  serialized PNG polling, with a one-second delay after each capture, so its
+  actual rate is at most about one frame per second.
+- Marketplace schema/assets/build, 43 tests, upload retry tests, and v1 gate
+  pass with the actual screenshot. One unchanged entry has a category warning.
+- No public repository, tag, or marketplace PR has been published. Public
+  source liveness cannot pass until the approved repository/tag exist. See
+  `RELEASE_PLAN.md` and `LOCAL_VALIDATION.md` for the exact release checks.

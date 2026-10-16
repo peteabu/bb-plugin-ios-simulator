@@ -3,6 +3,7 @@
 // and the agent-consent switch. Mirrors Apple's Simulator shortcuts.
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
 } from "react";
@@ -32,6 +33,7 @@ import {
 } from "@/lib/sim-protocol";
 import { cn } from "@/lib/utils";
 import { BEZEL_ASSET_VERSION, fitBezel, isDeviceBezel, type DeviceBezel } from "@/lib/device-bezel";
+import { displayPointToRaw, screenGeometry } from "@/lib/screen-geometry";
 import { startVideoStream, webCodecsAvailable, type VideoStats } from "@/components/video-stream";
 
 type Device = SimulatorState["devices"][number];
@@ -151,12 +153,14 @@ export function fitDevice(
   const bezelFraction = kind === "phone" ? 0.04 : 0.03;
   const availableWidth = Math.max(0, box.width - padding * 2);
   const availableHeight = Math.max(0, box.height - padding * 2);
-  const byHeight = availableHeight / (1 + 2 * bezelFraction * ratio);
-  const byWidth = availableWidth / (1 + 2 * bezelFraction) / ratio;
+  const shortSideRatio = Math.min(ratio, 1);
+  const byHeight = availableHeight / (1 + 2 * bezelFraction * shortSideRatio);
+  const byWidth = availableWidth / (ratio + 2 * bezelFraction * shortSideRatio);
   const screenHeight = Math.max(0, Math.min(byHeight, byWidth));
   const screenWidth = screenHeight * ratio;
-  const bezel = Math.max(4, Math.min(18, screenWidth * bezelFraction));
-  const screenRadius = screenWidth * (kind === "phone" ? 0.13 : 0.045);
+  const shortSide = Math.min(screenWidth, screenHeight);
+  const bezel = Math.max(4, Math.min(18, shortSide * bezelFraction));
+  const screenRadius = shortSide * (kind === "phone" ? 0.13 : 0.045);
   return {
     screenWidth,
     screenHeight,
@@ -194,7 +198,7 @@ function DeviceScreen({
   const { send, config, connected } = useHidSocket(hidSocketUrl(base, udid));
   const [nonce, setNonce] = useState(0);
   const [loaded, setLoaded] = useState(false);
-  const [naturalRatio, setNaturalRatio] = useState<number | null>(null);
+  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(null);
   const [bezel, setBezel] = useState<DeviceBezel | null>(null);
   // Prefer hardware H.264 over WebCodecs; MJPEG <img> is the fallback.
   const [mode, setMode] = useState<"video" | "mjpeg">(() => (webCodecsAvailable() ? "video" : "mjpeg"));
@@ -297,7 +301,7 @@ function DeviceScreen({
             attempt = 0;
             setLoaded(true);
           },
-          onSize: (width, height) => setNaturalRatio(width / height),
+          onSize: (width, height) => setNaturalSize({ width, height }),
           onStats,
           onFallback: () => {
             if (!disposed) {
@@ -322,19 +326,29 @@ function DeviceScreen({
     };
   }, [mode, base, udid, session.startedAt, onStats]);
 
-  const ratio = config ? config.width / config.height : (naturalRatio ?? (kind === "phone" ? 9 / 19.5 : 3 / 4));
+  const rawSize = naturalSize ?? config ?? (kind === "phone" ? { width: 9, height: 19.5 } : { width: 3, height: 4 });
+  const geometry = screenGeometry(rawSize, config?.orientation);
+  const ratio = geometry.width / geometry.height;
   const fit = fitDevice(box, ratio, kind);
-  const localFit = bezel ? fitBezel(box, bezel, config?.orientation, ratio > 1) : null;
+  const localFit = bezel ? fitBezel(box, bezel, geometry.bodyRotation) : null;
   const width = localFit?.screenWidth ?? fit.screenWidth;
   const height = localFit?.screenHeight ?? fit.screenHeight;
+  const quarterTurn = geometry.contentRotation === 90 || geometry.contentRotation === 270;
+  const contentWidth = quarterTurn ? height : width;
+  const contentHeight = quarterTurn ? width : height;
+  const contentStyle: CSSProperties = {
+    position: "absolute", width: contentWidth, height: contentHeight,
+    left: (width - contentWidth) / 2, top: (height - contentHeight) / 2,
+    transform: `rotate(${geometry.contentRotation}deg)`, transformOrigin: "center",
+  };
 
   const normalized = (event: ReactPointerEvent<HTMLElement>) => {
     const rect = surfaceRef.current?.getBoundingClientRect();
     if (!rect || rect.width === 0 || rect.height === 0) return null;
-    return {
+    return displayPointToRaw({
       x: clamp01((event.clientX - rect.left) / rect.width),
       y: clamp01((event.clientY - rect.top) / rect.height),
-    };
+    }, geometry.contentRotation);
   };
 
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -425,12 +439,18 @@ function DeviceScreen({
             ))}
           </div>
         ) : kind === "phone" ? (
-          <>
+          <div aria-hidden="true" className="pointer-events-none absolute" style={{
+            width: geometry.landscape ? fit.frameHeight : fit.frameWidth,
+            height: geometry.landscape ? fit.frameWidth : fit.frameHeight,
+            left: geometry.landscape ? (fit.frameWidth - fit.frameHeight) / 2 : 0,
+            top: geometry.landscape ? (fit.frameHeight - fit.frameWidth) / 2 : 0,
+            transform: `rotate(${geometry.bodyRotation}deg)`,
+          }}>
             {sideButton("left", "14%", "4%")}
             {sideButton("left", "21%", "7%")}
             {sideButton("left", "30%", "7%")}
             {sideButton("right", "23%", "11%")}
-          </>
+          </div>
         ) : null}
       <div
         ref={surfaceRef}
@@ -459,7 +479,8 @@ function DeviceScreen({
         {mode === "video" ? (
           <canvas
             ref={canvasRef}
-            className={cn("block h-full w-full select-none bg-black transition-opacity", !loaded && "opacity-0")}
+            style={contentStyle}
+            className={cn("block select-none bg-black transition-opacity", !loaded && "opacity-0")}
           />
         ) : null}
         {mode === "mjpeg" ? (
@@ -472,15 +493,16 @@ function DeviceScreen({
             setLoaded(true);
             const image = event.currentTarget;
             if (image.naturalWidth > 0 && image.naturalHeight > 0) {
-              setNaturalRatio(image.naturalWidth / image.naturalHeight);
+              setNaturalSize({ width: image.naturalWidth, height: image.naturalHeight });
             }
           }}
           onError={() => {
             if (retryTimer.current) clearTimeout(retryTimer.current);
             retryTimer.current = setTimeout(() => setNonce((value) => value + 1), 1_500);
           }}
+          style={contentStyle}
           className={cn(
-            "block h-full w-full select-none bg-black object-contain transition-opacity",
+            "block select-none bg-black object-contain transition-opacity",
             !loaded && "opacity-0",
           )}
         />
@@ -583,8 +605,11 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
   }, [refetch]);
   useRealtime("sessions-changed", refetch);
   useRealtime("attached", (payload) => {
-    const signal = payload as { threadId?: unknown } | null;
-    if (signal?.threadId === threadId) refetch();
+    const signal = payload as { threadId?: unknown; udid?: unknown } | null;
+    if (signal?.threadId === threadId && typeof signal.udid === "string") {
+      setSelected(signal.udid);
+      refetch();
+    }
   });
   useRealtime("agent-activity", (payload) => {
     const signal = payload as { udid?: unknown; active?: unknown } | null;

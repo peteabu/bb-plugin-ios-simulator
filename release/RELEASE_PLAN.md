@@ -1,135 +1,132 @@
 # Proposed public release
 
-This is a local preparation record. No repository, tag, npm package,
-marketplace branch, or pull request has been published.
+Local implementation and marketplace preparation are complete. No public
+repository, release tag, marketplace branch, or pull request has been created.
+Public-source verification still requires the approved release to exist.
 
-## Identity and source
+## Release identity
 
-- Authenticated GitHub account: **peteabu** (Peter Abu), verified read-only.
-- Proposed public repository: **peteabu/bb-plugin-ios-simulator**.
-- Proposed remote: `https://github.com/peteabu/bb-plugin-ios-simulator.git`.
-  The repository did not exist at the preparation check (GitHub returned 404).
-- Package: **bb-plugin-ios-simulator 0.1.0**; derived BB plugin ID:
-  **ios-simulator**.
-- Release tag: **v0.1.0**; marketplace Git tracking range: **^0.1.0**.
-- Release commit: **pending the final verified local commit**. Record its full
-  SHA in the approval request before running any release command.
-- Existing public marketplace fork: **peteabu/marketplace**.
-- Local marketplace draft branch: **submit-ios-simulator**. Its matching remote
-  branch was absent at the initial read-only check; none has been pushed.
-- npm is not the selected release source. Do not run `npm publish`.
+- GitHub account: **peteabu** (Peter Abu), verified read-only.
+- Repository: **peteabu/bb-plugin-ios-simulator**.
+- URL: `https://github.com/peteabu/bb-plugin-ios-simulator.git`.
+- Package: **bb-plugin-ios-simulator 0.1.0**; BB ID: **ios-simulator**.
+- Proposed immutable tag: **v0.1.0**; marketplace range: **^0.1.0**.
+- Final plugin commit: record its full SHA in the separate approval handoff
+  after the final local documentation commit. Do not approve a moving HEAD.
+- Marketplace fork: **peteabu/marketplace**, branch **submit-ios-simulator**.
+- Final local marketplace commit:
+  **8bb129d4190733ddf8fcdcc059f393450ee59d00**.
+- Git is the release source; npm publication is not proposed.
 
-## Prepared files
+## Verified result
 
-`marketplace/entries/ios-simulator.json`, the vendored SVG icon under
-`marketplace/icons/`, and `marketplace/overview/ios-simulator.md` follow the
-current community v2 contract. The overview is copied from the plugin's
-`PLUGIN_OVERVIEW.md`.
+- **110 tests across 14 files**, TypeScript checking, and the BB plugin build
+  pass. The plugin reloaded successfully.
+- Explicit attachment selects the requested iPhone 17 Pro in the panel and
+  promotes it as the default for subsequent tools, including reattachment.
+- Native BB Home, Lock, and the toolbar's full rotation cycle pass. Portrait,
+  landscape, and return-to-portrait display align the image, device frame,
+  and mask. Foreground pointer actions hit the expected asymmetric targets
+  in portrait, landscape left, and landscape right; screenshots and HTTP
+  target logs confirm the mapping.
+- A persistent 90-second H.264 check decoded **546/546 frames without errors**,
+  including the Lock transition before the second keyframe. The suspected
+  encoder freeze was not reproduced; no new native encoder patch was needed.
+- Unicode insertion was verified in Truffle. Android shared screenshots now
+  survive cancellation of one caller while another caller still waits.
+- Both native binaries, source, build scripts, metadata, and MIT/Apache-2.0
+  and node-swift/node-gyp notices are tracked. Binary hashes match metadata.
+  Runtime serve-sim is pinned exactly to **0.1.48** in manifest and lockfile.
+  No Xcode device artwork is bundled.
 
-The current marketplace was read from its default branch at commit
-`92aa56203ec26369bbf1ba05028bade5fe3a5606`. Its full-history local validation
-checkout is `/tmp/bb-ios-marketplace-review` (temporary, not a release source).
-The inspected contract includes README, the v2 schema, category list, icon
-rules, and two current entries. A local-only draft commit in that temporary
-checkout is `852fd8e5f0584644cd119af73e0efea7e40d3a9d`, containing only the
-entry, icon, and overview. Its `origin` is the official upstream repository;
-do not push it there. Use the submitter fork for any approved submission.
+See `VERIFICATION.md` for the detailed live checks and their evidence.
 
-## Checks and remaining work
+## Marketplace artifacts and checks
 
-- Exact runtime dependency `serve-sim: 0.1.48` and root lockfile agree.
-- Published npm tarball source and SHA-1 were verified. Apache-2.0 attribution,
-  node-swift/node-gyp licenses, source modification notice, locked build
-  dependencies, and native reproduction steps are included.
-- Native capture module rebuilt successfully on Xcode 27 and its ad-hoc
-  signature verified. The UIKit clipboard helper built successfully and
-  passed three live Unicode/multiline clipboard round trips. Their SHA-256
-  values and targets are in `native/BUILD_METADATA.json`.
-- Nine focused native-installer tests pass, including mismatched versions,
-  missing/invalid manifests, missing targets, and restoration safety.
-- Current marketplace v2 entry schema, reserved ID check, categories, icon,
-  and overview validators pass. All 43 marketplace tests and its upload retry
-  tests pass.
-- **A real BB screenshot is still required.** Computer Use returned
-  "Computer Use was not approved to use bb". No BB screenshot was captured or
-  invented. The draft entry deliberately has an empty screenshots array;
-  do not submit it that way. Capture the installed panel/header with real
-  app content, at least 1200 pixels wide, at most 2 MiB, without private paths
-  or conversation text. Put it under `screenshots/ios-simulator/` and add its
-  exact relative path to the entry.
-- **Full marketplace build and v1 gate pass.** After the authorized local-only
-  draft commit supplied the required first-addition date, `npm run build`
-  generated both documents with 384 entries. `npm run gate:v1` passes: the
-  single new entry needs no v1-change exception. The build reports one
-  unrelated unchanged entry without a category. The proposed source is unpublished (GitHub returns404), so its source
-  liveness check cannot pass until the approved public repository and tag
-  exist. The broad `npm run check` was stopped after it began checking all
-  384 entries; the current script has no plugin filter (only `--liveness`
-  and `--ranking`). It is not recorded as passed. Add the real screenshot to a new local commit and
-  repeat the marketplace checks before submission.
-- **Live Android verification is pending.** This host has no Android SDK or
-  AVD. Its initial path uses serialized PNG polling, not video.
-- The final root verification reports **82 passing plugin tests across
-  12 files**, successful TypeScript checking, `bb plugin build`, and plugin
-  reload. A live Truffle screenshot confirms Unicode text insertion. Record
-  the final release commit separately before approval.
-- Confirm both `native/serve-sim-native.node` and
-  `native/simulator-pasteboard`, their source, and their notices are included
-  in the final Git commit. Build caches, node_modules, and dist stay ignored
-  in Git; BB builds a Git source install. The current source npm pack omits
-  dist, so this is not an npm publication candidate.
+The draft under `marketplace/` matches the clean, full-history checkout at
+`/tmp/bb-ios-marketplace-review`. Its final branch diff contains exactly:
 
-## Performance verification conditions
+- `entries/ios-simulator.json`
+- `icons/ios-simulator-c4007f39.svg`
+- `overview/ios-simulator.md`
+- `screenshots/ios-simulator/panel-eb92b3d6.png`
 
-The automated page-phase benchmark measured static capture at **6.7 fps and
-21 KiB/s**, and animation at **53.1 fps and 136 KiB/s**. Animation frame gaps
-had a **16 ms median**, **25 ms 90th percentile**, and **two stalls longer than
-120 ms during an 8-second sample**.
+The overview is an unchanged copy of `PLUGIN_OVERVIEW.md`. The screenshot is
+a reviewed real native BB panel crop showing Truffle's Create conversation
+and Wikipedia topics, Apple device frame, picker, and footer controls. It is
+**1472×1600**, **278,376 bytes**, with no private chat or paths. The latest
+fixes do not change portrait appearance; the reviewed image remains accurate.
+The original full private BB window capture is excluded.
 
-This was a loaded-host result: system load was **26–38** and existing alignment
-workers remained busy. The requested quiet-host retest has **not** been
-fulfilled. No user's worker processes were stopped to manufacture a quiet
-sample. Repeat the benchmark when the Mac is quiet before making a quiet-host
-performance claim.
+Current checks pass with that screenshot: v2 schema, plugin ID/categories,
+content hashes, image format/width/size, no orphan screenshots, overview and
+draft-copy equality, full marketplace build (**384 entries**), all **43
+marketplace tests**, upload retry tests, v1 addition gate, and whitespace.
+One unchanged entry has an unrelated missing-category warning.
 
-## Commands requiring release approval
+The official marketplace default branch was re-fetched at
+`92aa56203ec26369bbf1ba05028bade5fe3a5606`. Its README, v2 schema, categories,
+icon rules, and current entries supplied the contract. The temporary checkout
+is clean. Its `origin` points at official upstream; publish only to the
+submitter fork using a separate remote.
 
-The submit-a-plugin workflow requires approval before the first release
-mutation. Show the exact full commit SHA, account, repository, version, tag,
-source range, and commands together. Replace the commit placeholder below
-with that approved SHA; never approve a moving `HEAD` implicitly.
+Public-source liveness was deliberately omitted while the proposed plugin
+repository is unpublished. The last targeted source check returned Repository
+not found. Run it after the approved public repository and tag exist; it is
+not recorded as passed.
 
-From the plugin checkout, after the final local commit and checks:
+## Performance limits
+
+The historical loaded-host transport sample measured static capture at
+**6.7 fps / 21 KiB/s** and animation at **53.1 fps / 136 KiB/s**. Frame-gap
+median was **16 ms**, p90 **25 ms**, with **two gaps over 120 ms in 8 s**.
+Host load was **26–38**; concurrent device use during that sample has not
+been established.
+
+A later **50.5 fps** original-device retest was affected by concurrent thread
+use and remains provisional. A separate-device run measured **47.7 fps**,
+**382 frames in 8 s**, median **17 ms**, p90 **30 ms**, and **two gaps over
+120 ms**. Idle was **2.5 fps**, **15 frames in 6.01 s**. That device was isolated,
+but host load was about **657 before** and **159 after**. These samples do not
+fulfil a quiet-host retest or support normal-host performance claims.
+
+Live Android verification still requires an SDK/AVD on a suitable host.
+The current Android path uses PNG polling, not video or accessibility
+inspection. The source npm pack omits dist; this is a Git release candidate.
+
+## One publication approval
+
+The submit-a-plugin skill requires approval before the first release
+mutation. Prepare one approval request containing the final full plugin
+commit SHA, the marketplace commit above, account, repository URLs,
+package/version, tag/range, and all commands below. That single approval
+covers both the plugin release and marketplace submission for those exact
+commits and commands. No publication approval has been requested or inferred.
+
+From the plugin checkout, substitute the approved full plugin commit SHA:
 
 ```sh
 gh repo create peteabu/bb-plugin-ios-simulator --public --source . --remote origin
-git tag -a v0.1.0 FULL_APPROVED_COMMIT_SHA -m 'Release v0.1.0'
-git push -u origin main
-git push origin v0.1.0
+git tag -a v0.1.0 FULL_APPROVED_PLUGIN_COMMIT_SHA -m 'Release v0.1.0'
+git push origin FULL_APPROVED_PLUGIN_COMMIT_SHA:refs/heads/main
+git push origin refs/tags/v0.1.0
 ```
 
-Read-only verification after the push:
+Verify the public tag resolves to the approved commit and run marketplace
+source validation before continuing. From the prepared marketplace checkout:
 
 ```sh
-git ls-remote --tags https://github.com/peteabu/bb-plugin-ios-simulator.git
-```
-
-For the marketplace, use a fresh full-history checkout of the existing fork,
-add `upstream` for `https://github.com/get-bb/marketplace.git`, create
-`submit-ios-simulator` from current upstream/main, and copy only the entry,
-icon, real screenshots, and overview. Make the local submission commit.
-Run `npm ci --ignore-scripts`, `npm run build`, `npm test`, `npm run gate:v1`,
-`npm run check`, and `git diff --check` before approval for its publication.
-Then the remote commands are:
-
-```sh
-git push -u origin submit-ios-simulator
+git remote add submitter https://github.com/peteabu/marketplace.git
+npm run check
+git push submitter 8bb129d4190733ddf8fcdcc059f393450ee59d00:refs/heads/submit-ios-simulator
 gh pr create --repo get-bb/marketplace --base main \
   --head peteabu:submit-ios-simulator --title 'Add plugin entry: ios-simulator' \
   --body-file /ABSOLUTE/PATH/marketplace-pr-body.md
 ```
 
-The marketplace pull request must contain only its entry, icon, real
-screenshots, and overview. It must state the selected release source,
-actual plugin and marketplace validation results, local runtime requirements,
-what each screenshot shows, and that the overview came from the plugin repo.
+Fill the exact body-file path in the approval handoff. The local remote-add
+command is unnecessary if an already verified `submitter` remote exists.
+Continue with the approved marketplace publication once source checks pass;
+no second approval is needed for unchanged approved commits and commands.
+If validation requires code or artifact changes, update the concrete release
+handoff before publishing changed commits.

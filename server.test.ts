@@ -117,6 +117,32 @@ describe("iOS Simulator plugin", () => {
     expect(state).toMatchObject({ attached: ["AAAA-1"], bootedByPlugin: ["AAAA-1"], agentControl: "always" });
   });
 
+  it("promotes explicit attachments and reattachments without ordinary tools changing the default", async () => {
+    const { harness, calls } = await load({
+      execScript: (_file, args) => args[1] === "list"
+        ? { stdout: DEVICE_LIST.replaceAll('"Shutdown"', '"Booted"') } : undefined,
+    });
+    await harness.behavior.callAgentTool("ios_sim_attach", { device: "AAAA-2" }, CTX);
+    await harness.behavior.callAgentTool("ios_sim_attach", { device: "AAAA-1" }, CTX);
+    expect(await harness.behavior.callRpc("state", { threadId: "thr_1" }))
+      .toMatchObject({ attached: ["AAAA-1", "AAAA-2"] });
+    await harness.behavior.callAgentTool("ios_sim_open_url", { url: "https://example.com" }, CTX);
+    expect(calls).toContainEqual(["xcrun", "simctl", "openurl", "AAAA-1", "https://example.com"]);
+
+    const selectionSignals = () => harness.realtimeSignals.filter((signal) => signal.channel === "attached");
+    const before = selectionSignals().length;
+    await harness.behavior.callAgentTool("ios_sim_open_url", { device: "AAAA-2", url: "https://example.org" }, CTX);
+    expect(selectionSignals()).toHaveLength(before);
+    expect(await harness.behavior.callRpc("state", { threadId: "thr_1" }))
+      .toMatchObject({ attached: ["AAAA-1", "AAAA-2"] });
+
+    await harness.behavior.callAgentTool("ios_sim_attach", { device: "AAAA-2" }, CTX);
+    expect(selectionSignals()).toHaveLength(before + 1);
+    expect(selectionSignals().at(-1)?.payload).toMatchObject({ threadId: "thr_1", udid: "AAAA-2" });
+    expect(await harness.behavior.callRpc("state", { threadId: "thr_1" }))
+      .toMatchObject({ attached: ["AAAA-2", "AAAA-1"] });
+  });
+
   it("taps by accessibility label through the HID socket", async () => {
     const { harness, sent } = await load();
     const result = await harness.behavior.callAgentTool("ios_sim_tap", { element: "sign in" }, CTX);
