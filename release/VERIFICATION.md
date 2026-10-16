@@ -2,7 +2,7 @@
 
 ## Plugin checks
 
-- TypeScript passes. All 82 tests across 12 files pass, including native-version
+- TypeScript passes. All 94 tests across 13 files pass, including native-version
   guards, consent, device ownership, input cancellation, clipboard failure,
   concurrent text, Android boot identity, and UI geometry/controls.
 - `bb plugin build` succeeds. The path-installed plugin reloads and restores
@@ -27,9 +27,33 @@ search results. The UIKit helper also passed three byte-for-byte pasteboard
 round trips containing Unicode, line breaks, tabs, and emoji. Every clipboard
 write is read back before sending Command-V; a silent failed write is an error.
 
-The live bezel route returned matching local DeviceKit artwork with a 438×910
-frame, a 402×874 screen at (18,18), and a 62-point corner radius. Its image route
-returned valid rasterized PNG artwork. No Apple artwork is bundled.
+The corrected live bezel route returns Apple's 436×908 composite body with a
+402×874 screen at (17,17). The body is rasterized from its vector PDF at 3×
+(1308×2724); the native framebuffer alpha mask is 1206×2622 and is rendered
+separately for all four orientations. This replaces inferred nine-slice sizing,
+72dpi artwork, and a circular CSS screen crop. No Apple artwork is bundled.
+
+## Frame, toolbar, and viewer follow-up
+
+- Live button RPC response time measured 74.4 ms before and 3.2 ms after the
+  persistent HID connection change. The previous fixed waits were 70 ms per
+  button and 110 ms per rotation. These measurements cover dispatch, not the
+  simulator's animation completion or browser input-to-paint latency.
+- Toolbar controls have pending feedback and keep their layout independent of
+  changing video statistics. Repeated rotations advance from the last requested
+  orientation while the simulator's configuration catches up.
+- The viewer uses composited canvas painting with high-quality scaling. On
+  disconnect it closes its decoder, frame handles, timers, and transport before
+  reconnecting; late frames cannot paint after disposal.
+- Fitness flicker was independently reproduced in 12 `simctl` screenshots as
+  well as 108 MJPEG frames. The Fitness+ card alternates loading placeholders
+  and Content Unavailable before the plugin viewer. Relaunching Fitness still
+  showed a loading error. No native capture modification was justified; the
+  underlying Fitness/Xcode cause remains undetermined.
+- Geometry, raster dimensions, alpha edges, rotation, lifecycle, and controls
+  were checked through native output, HTTP, and the SDK test harness. Native
+  BB-window visual inspection remains blocked by Computer Use approval; no
+  claim is made that its final on-screen appearance was visually verified.
 
 ## Stream measurement
 

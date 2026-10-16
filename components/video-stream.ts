@@ -42,7 +42,9 @@ export function startVideoStream(
   callbacks: VideoStreamCallbacks,
 ): VideoStreamHandle {
   const controller = new AbortController();
-  const context = canvas.getContext("2d", { alpha: false, desynchronized: true });
+  // Present complete frames through the compositor. Desynchronized canvases
+  // may expose a partially drawn frame while the display is scanning out.
+  const context = canvas.getContext("2d", { alpha: false });
   let decoder: VideoDecoder | null = null;
   let configured = false;
   let sawKeyframe = false;
@@ -118,6 +120,8 @@ export function startVideoStream(
     const height = isFrame ? (source as VideoFrame).displayHeight : (source as ImageBitmap).height;
     try {
       fitBacking(width, height);
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "high";
       context.drawImage(source, 0, 0, canvas.width, canvas.height);
       paintedCount += 1;
       lastPaintAt = performance.now();
@@ -131,6 +135,7 @@ export function startVideoStream(
   };
 
   const queuePaint = (source: VideoFrame | ImageBitmap, isFrame: boolean) => {
+    if (stopped) { source.close(); return; }
     if (pending) pending.close();
     pending = source;
     pendingIsFrame = isFrame;
@@ -161,6 +166,12 @@ export function startVideoStream(
     callbacks.onFallback(reason);
   };
 
+  const disconnect = (reason: string) => {
+    if (stopped) return;
+    stop();
+    callbacks.onDisconnect(reason);
+  };
+
   const ensureDecoder = () => {
     if (decoder && decoder.state !== "closed") return decoder;
     decoder = new VideoDecoder({
@@ -174,6 +185,7 @@ export function startVideoStream(
   };
 
   const handle = async (tag: number, payload: Uint8Array) => {
+    if (stopped) return;
     if (tag === AVCC_TAG.SEED_JPEG) {
       if (painted) return;
       try {
@@ -194,9 +206,11 @@ export function startVideoStream(
         hardwareAcceleration: "prefer-hardware",
       };
       let support = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
+      if (stopped) return;
       if (!support.supported) {
         delete config.hardwareAcceleration;
         support = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
+        if (stopped) return;
       }
       if (!support.supported) {
         fail(`codec ${codec} unsupported`);
@@ -223,15 +237,16 @@ export function startVideoStream(
   };
 
   (async () => {
+    if (!context) { fail("2D canvas unavailable"); return; }
     let response: Response;
     try {
       response = await fetch(url, { signal: controller.signal, cache: "no-store" });
     } catch (error) {
-      if (!stopped) callbacks.onDisconnect(`connect failed: ${String(error)}`);
+      disconnect(`connect failed: ${String(error)}`);
       return;
     }
     if (!response.ok || !response.body) {
-      callbacks.onDisconnect(`HTTP ${response.status}`);
+      disconnect(`HTTP ${response.status}`);
       return;
     }
     const reader = response.body.getReader();
@@ -246,9 +261,9 @@ export function startVideoStream(
         buffer = rest;
         for (const record of records) await handle(record.tag, record.payload);
       }
-      if (!stopped) callbacks.onDisconnect("stream ended");
+      disconnect("stream ended");
     } catch (error) {
-      if (!stopped) callbacks.onDisconnect(`stream error: ${String(error)}`);
+      disconnect(`stream error: ${String(error)}`);
     }
   })();
 

@@ -450,19 +450,19 @@ export class SimulatorService {
     });
   }
 
-  async pressButton(udid: string, button: HardwareButton): Promise<void> {
+  async pressButton(udid: string, button: HardwareButton, signal?: AbortSignal): Promise<void> {
     const spec = HARDWARE_BUTTONS[button];
     await this.options.streams.withHid(udid, async (hid) => {
+      signal?.throwIfAborted();
       hid.send(HID.BUTTON, spec);
-      await sleep(40);
-    });
+    }, signal);
   }
 
-  async rotate(udid: string, orientation: Orientation): Promise<void> {
+  async rotate(udid: string, orientation: Orientation, signal?: AbortSignal): Promise<void> {
     await this.options.streams.withHid(udid, async (hid) => {
+      signal?.throwIfAborted();
       hid.send(HID.ORIENTATION, { orientation });
-      await sleep(80);
-    });
+    }, signal);
   }
 
   async installAndLaunch(

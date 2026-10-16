@@ -2,13 +2,15 @@
 export const BEZEL_PARTS = [
   "topLeft", "top", "topRight", "right", "bottomRight", "bottom", "bottomLeft", "left",
 ] as const;
-export type BezelPart = (typeof BEZEL_PARTS)[number];
+export type BezelPart = (typeof BEZEL_PARTS)[number] | "composite";
+/** Bumps image URLs so previously cached 72dpi artwork is not reused. */
+export const BEZEL_ASSET_VERSION = 3;
 
 export interface DeviceBezel {
   source: "xcode";
   width: number;
   height: number;
-  screen: { x: number; y: number; width: number; height: number; cornerRadius: number };
+  screen: { x: number; y: number; width: number; height: number; cornerRadius: number; mask?: boolean };
   layers: Array<{ id: BezelPart; x: number; y: number; width: number; height: number }>;
 }
 
@@ -22,8 +24,10 @@ export function isDeviceBezel(value: unknown): value is DeviceBezel {
     && positive(frame.screen.width) && positive(frame.screen.height)
     && frame.screen.x + frame.screen.width <= frame.width
     && frame.screen.y + frame.screen.height <= frame.height
-    && Array.isArray(frame.layers) && frame.layers.length === BEZEL_PARTS.length
-    && frame.layers.every((layer) => BEZEL_PARTS.includes(layer.id)
+    && (frame.screen.mask === undefined || typeof frame.screen.mask === "boolean")
+    && Array.isArray(frame.layers)
+    && (frame.layers.length === BEZEL_PARTS.length || (frame.layers.length === 1 && frame.layers[0]?.id === "composite"))
+    && frame.layers.every((layer) => (layer.id === "composite" || BEZEL_PARTS.includes(layer.id))
       && [layer.x, layer.y].every((number) => typeof number === "number" && Number.isFinite(number))
       && positive(layer.width) && positive(layer.height));
 }

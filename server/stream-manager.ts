@@ -86,6 +86,9 @@ interface InternalSession extends StreamSession {
   exited: boolean;
   ready: Promise<StreamSession>;
   pacer: { stop(): void } | null;
+  hidSockets: Set<WebSocket>;
+  control: HidConnection | null;
+  controlConnecting: Promise<HidConnection> | null;
 }
 
 function isExecutable(path: string): boolean {
@@ -290,6 +293,9 @@ export class StreamManager {
       exited: false,
       ready: Promise.resolve({ udid, port, pid: child.pid ?? null, startedAt: Date.now() }),
       pacer: null,
+      hidSockets: new Set(),
+      control: null,
+      controlConnecting: null,
     };
     const remember = (chunk: unknown) => {
       for (const line of String(chunk).split("\n")) {
@@ -344,7 +350,12 @@ export class StreamManager {
       // 0x0 clears any preferred surface so the capture keeps following the
       // largest live framebuffer (it changes on rotation); the message still
       // forces an immediate capture, which is the point.
-      connection.send(HID.PREFERRED_SIZE, { width: 0, height: 0 });
+      try { connection.send(HID.PREFERRED_SIZE, { width: 0, height: 0 }); }
+      catch {
+        // A capture tick can race the socket's close event. Leave reconnecting
+        // to onClose rather than throwing from this background timer.
+        connection.close();
+      }
     };
     const connect = () => {
       if (stopped || session.exited) return;
@@ -412,6 +423,7 @@ export class StreamManager {
     session.exited = true;
     session.pacer?.stop();
     session.pacer = null;
+    this.closeHidSockets(session);
     if (this.sessions.get(session.udid) === session) this.sessions.delete(session.udid);
     this.options.onChange?.();
   }
@@ -422,6 +434,7 @@ export class StreamManager {
     this.sessions.delete(udid);
     session.pacer?.stop();
     session.pacer = null;
+    this.closeHidSockets(session);
     if (session.exited) return;
     this.options.log.info(`stopping serve-sim for ${udid}`);
     await terminate(session.child);
@@ -459,46 +472,58 @@ export class StreamManager {
   }
 
   /** Open a HID socket to the helper; resolves once the helper accepted it. */
-  openHid(udid: string): Promise<HidConnection> {
+  openHid(udid: string, signal?: AbortSignal): Promise<HidConnection> {
     const session = this.sessions.get(udid);
     if (!session || session.exited) {
       return Promise.reject(new Error(`No stream is running for ${udid}.`));
     }
     const url = `ws://127.0.0.1:${session.port}/helper/${encodeURIComponent(udid)}/ws`;
     return new Promise((resolve, reject) => {
-      const socket = new this.WebSocketCtor(url);
+      signal?.throwIfAborted();
+      const socket = new this.WebSocketCtor(url, { handshakeTimeout: 5_000 });
+      session.hidSockets.add(socket);
       socket.binaryType = "nodebuffer";
       const messageListeners = new Set<(data: Uint8Array) => void>();
       const closeListeners = new Set<() => void>();
       let config: ScreenConfig | null = null;
       let settled = false;
+      let closed = false;
+      const send = (data: Uint8Array) => {
+        if (socket.readyState !== socket.OPEN)
+          throw new Error("The simulator input connection closed. Try the action again.");
+        socket.send(data);
+      };
+      const abort = () => { socket.terminate(); };
+      signal?.addEventListener("abort", abort, { once: true });
       const connection: HidConnection = {
         get config() {
           return config;
         },
-        send: (opcode, payload) => {
-          if (socket.readyState === socket.OPEN) socket.send(encodeHid(opcode, payload));
-        },
-        sendRaw: (data) => {
-          if (socket.readyState === socket.OPEN) socket.send(data);
-        },
+        send: (opcode, payload) => send(encodeHid(opcode, payload)),
+        sendRaw: send,
         onMessage: (listener) => {
           messageListeners.add(listener);
           return () => messageListeners.delete(listener);
         },
         onClose: (listener) => {
+          if (closed) { queueMicrotask(listener); return () => {}; }
           closeListeners.add(listener);
           return () => closeListeners.delete(listener);
         },
         close: () => {
           try {
-            socket.close();
+            if (socket.readyState === socket.CONNECTING) socket.terminate();
+            else socket.close();
           } catch {
             // already closed
           }
         },
       };
       socket.on("open", () => {
+        if (signal?.aborted || session.exited || this.sessions.get(udid) !== session) {
+          socket.terminate();
+          return;
+        }
         settled = true;
         resolve(connection);
       });
@@ -510,7 +535,12 @@ export class StreamManager {
         for (const listener of messageListeners) listener(data);
       });
       socket.on("close", () => {
+        closed = true;
+        session.hidSockets.delete(socket);
+        signal?.removeEventListener("abort", abort);
         for (const listener of closeListeners) listener();
+        closeListeners.clear();
+        messageListeners.clear();
         if (!settled) {
           settled = true;
           reject(new Error("The simulator input socket closed before it opened."));
@@ -521,19 +551,45 @@ export class StreamManager {
           settled = true;
           reject(new Error(`Could not reach the simulator input socket: ${error.message}`));
         }
+        socket.terminate();
       });
     });
   }
 
-  async withHid<T>(udid: string, work: (hid: HidConnection) => Promise<T>): Promise<T> {
-    const hid = await this.openHid(udid);
-    try {
-      return await work(hid);
-    } finally {
-      // Give the last frame time to flush before the socket closes.
-      await sleep(30);
-      hid.close();
+  private closeHidSockets(session: InternalSession): void {
+    session.control = null;
+    for (const socket of session.hidSockets) socket.terminate();
+    session.hidSockets.clear();
+  }
+
+  /** One session-owned control socket; reconnect only before the next action. */
+  private controlHid(udid: string): Promise<HidConnection> {
+    const session = this.sessions.get(udid);
+    if (!session || session.exited) return Promise.reject(new Error(`No stream is running for ${udid}.`));
+    if (session.control) return Promise.resolve(session.control);
+    if (!session.controlConnecting) {
+      const pending = this.openHid(udid).then((hid) => {
+        if (session.exited || this.sessions.get(udid) !== session) {
+          hid.close();
+          throw new Error("The simulator stream stopped before the input connection opened.");
+        }
+        session.control = hid;
+        hid.onClose(() => { if (session.control === hid) session.control = null; });
+        return hid;
+      });
+      session.controlConnecting = pending;
+      void pending.finally(() => {
+        if (session.controlConnecting === pending) session.controlConnecting = null;
+      }).catch(() => undefined);
     }
+    return session.controlConnecting;
+  }
+
+  async withHid<T>(udid: string, work: (hid: HidConnection) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    signal?.throwIfAborted();
+    const hid = await cancellable(this.controlHid(udid), signal);
+    signal?.throwIfAborted();
+    return work(hid);
   }
 
   private publicSession(session: InternalSession): StreamSession {
@@ -544,6 +600,16 @@ export class StreamManager {
       startedAt: session.startedAt,
     };
   }
+}
+
+function cancellable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    if (signal.aborted) abort();
+  });
 }
 
 function toBytes(raw: unknown): Uint8Array {

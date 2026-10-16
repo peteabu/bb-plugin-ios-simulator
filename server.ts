@@ -409,9 +409,12 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
             socket.close(1011, describe(error).slice(0, 120));
           }
         },
-        onMessage(_socket, data) {
+        onMessage(socket, data) {
           const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-          if (upstream) upstream.sendRaw(bytes);
+          if (upstream) {
+            try { upstream.sendRaw(bytes); }
+            catch (error) { socket.close(1011, describe(error).slice(0, 120)); }
+          }
           else if (pending.length < 256) pending.push(bytes);
         },
         onClose() {
@@ -715,7 +718,7 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       parameters: z.object({ device: deviceParam, button: buttonEnum }),
       async execute({ device, button }, ctx) {
         return withDevice(ctx, device, { input: true }, async (dev) => {
-          await service.pressButton(dev.udid, button);
+          await service.pressButton(dev.udid, button, ctx.signal);
           return `Pressed ${button}.`;
         });
       },
@@ -728,7 +731,7 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       parameters: z.object({ device: deviceParam, orientation: orientationEnum }),
       async execute({ device, orientation }, ctx) {
         return withDevice(ctx, device, {}, async (dev) => {
-          await service.rotate(dev.udid, orientation);
+          await service.rotate(dev.udid, orientation, ctx.signal);
           return `Rotated to ${orientation}.`;
         });
       },

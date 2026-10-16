@@ -112,4 +112,55 @@ describe("iOS Simulator app", () => {
     expect(shortcutFor({ key: "ArrowRight", metaKey: true, ctrlKey: false, shiftKey: false })).toEqual({ rotate: true });
     expect(shortcutFor({ key: "a", metaKey: false, ctrlKey: false, shiftKey: false })).toBeNull();
   });
+
+  it("dispatches toolbar actions and keeps only the pending control disabled", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    vi.stubGlobal("WebSocket", class { close() {} });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => null })));
+    let finish!: (result: { ok: true }) => void;
+    const pending = new Promise<{ ok: true }>((resolve) => { finish = resolve; });
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
+      rpc: {
+        state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] },
+          attached: ["AAAA-2"], sessions: [{ udid: "AAAA-2", port: 1234, startedAt: 1 }] }),
+        button: () => pending,
+      },
+      context: { projectId: "p", threadId: "thr_1" },
+    });
+    const home = await slot.findByRole("button", { name: "Home (⌘⇧H)" });
+    fireEvent.click(home);
+    fireEvent.click(home);
+    await waitFor(() => expect(slot.inspection.rpcCalls.filter((call) => call.method === "button")).toHaveLength(1));
+    expect(home.getAttribute("aria-busy")).toBe("true");
+    expect((home as HTMLButtonElement).disabled).toBe(true);
+    expect((slot.getByRole("button", { name: "Volume up (⌘↑)" }) as HTMLButtonElement).disabled).toBe(false);
+    finish({ ok: true });
+    await waitFor(() => expect((home as HTMLButtonElement).disabled).toBe(false));
+    slot.lifecycle.unmount();
+  });
+
+  it("advances repeated rotations while the simulator config is still catching up", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    vi.stubGlobal("WebSocket", class { close() {} });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => null })));
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_1", params: null }, {
+      rpc: {
+        state: () => ({ ...STATE, ready: { ...STATE.ready, ok: true, problems: [] },
+          attached: ["AAAA-2"], sessions: [{ udid: "AAAA-2", port: 1234, startedAt: 1 }] }),
+        rotate: () => ({ ok: true }),
+      },
+      context: { projectId: "p", threadId: "thr_1" },
+    });
+    const rotate = await slot.findByRole("button", { name: "Rotate (⌘→)" });
+    fireEvent.click(rotate);
+    await waitFor(() => expect((rotate as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(rotate);
+    await waitFor(() => expect(slot.inspection.rpcCalls.filter((call) => call.method === "rotate")).toEqual([
+      { method: "rotate", input: { udid: "AAAA-2", orientation: "landscape_right" } },
+      { method: "rotate", input: { udid: "AAAA-2", orientation: "portrait_upside_down" } },
+    ]));
+    slot.lifecycle.unmount();
+  });
 });

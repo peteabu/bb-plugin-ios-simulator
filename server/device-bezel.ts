@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
@@ -16,7 +16,7 @@ interface BezelDependencies {
 
 interface ResolvedBezel {
   geometry: DeviceBezel;
-  files: Record<BezelPart, string>;
+  files: Partial<Record<BezelPart | "mask", { path: string; scale: number }>>;
 }
 
 interface ChromeImages {
@@ -26,10 +26,57 @@ interface ChromeImages {
 
 interface DeviceProfile {
   chromeIdentifier?: string;
+  framebufferMask?: string;
+  resourceDirectory: string;
   capabilities?: {
-    displays?: Array<{ deviceName?: string; chromeIdentifier?: string; width?: number; height?: number; scale?: number; cornerRadiusUL?: number }>;
+    displays?: Array<{ deviceName?: string; chromeIdentifier?: string; framebufferMaskIdentifier?: string; width?: number; height?: number; scale?: number; cornerRadiusUL?: number }>;
   };
 }
+
+// Quartz renders the vectors at the requested backing scale. sips ignores DPI
+// when rasterizing these PDFs, leaving a 110-point corner only 110 pixels wide.
+// The tiny renderer is compiled once into this instance's disposable directory;
+// neither Apple artwork nor generated binaries enter the plugin package.
+const PDF_RENDERER = String.raw`
+import Foundation
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
+
+guard CommandLine.arguments.count == 5,
+      let scale = Double(CommandLine.arguments[2]), scale > 0, scale <= 4,
+      let rotation = Int(CommandLine.arguments[3]), [0, 90, 180, 270].contains(rotation),
+      let pdf = CGPDFDocument(URL(fileURLWithPath: CommandLine.arguments[1]) as CFURL),
+      let page = pdf.page(at: 1) else { exit(1) }
+let box = page.getBoxRect(.mediaBox)
+let sideways = rotation == 90 || rotation == 270
+let width = Int(ceil((sideways ? box.height : box.width) * scale))
+let height = Int(ceil((sideways ? box.width : box.height) * scale))
+guard width > 0, height > 0, width <= 12000, height <= 12000,
+      let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+      let context = CGContext(data: nil, width: width, height: height,
+          bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace,
+          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { exit(1) }
+context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+context.setShouldAntialias(true)
+context.interpolationQuality = .high
+context.scaleBy(x: scale, y: scale)
+// CSS rotates clockwise in its top-left coordinate system; Quartz uses y-up.
+switch rotation {
+case 90: context.translateBy(x: 0, y: box.width); context.rotate(by: -.pi / 2)
+case 180: context.translateBy(x: box.width, y: box.height); context.rotate(by: .pi)
+case 270: context.translateBy(x: box.height, y: 0); context.rotate(by: .pi / 2)
+default: break
+}
+context.translateBy(x: -box.minX, y: -box.minY)
+context.drawPDFPage(page)
+guard let image = context.makeImage(),
+      let destination = CGImageDestinationCreateWithURL(
+          URL(fileURLWithPath: CommandLine.arguments[4]) as CFURL,
+          UTType.png.identifier as CFString, 1, nil) else { exit(1) }
+CGImageDestinationAddImage(destination, image, nil)
+guard CGImageDestinationFinalize(destination) else { exit(1) }
+`;
 
 function finite(value: unknown, max = 20_000): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= max;
@@ -49,6 +96,7 @@ export class DeviceBezels {
   private readonly devices = new Map<string, Promise<ResolvedBezel | null>>();
   private readonly images = new Map<string, Promise<Buffer | null>>();
   private directory: Promise<string> | null = null;
+  private renderer: Promise<string | null> | null = null;
   private disposed = false;
 
   constructor(private readonly dependencies: BezelDependencies) {}
@@ -88,7 +136,7 @@ export class DeviceBezels {
         exec("/usr/bin/plutil", ["-convert", "json", "-o", "-", join(dirname(path), "capabilities.plist")], { timeoutMs: 5_000 }),
       ]);
       if (profile.code === 0 && capabilities.code === 0) {
-        return { ...JSON.parse(profile.stdout), capabilities: JSON.parse(capabilities.stdout).capabilities };
+        return { ...JSON.parse(profile.stdout), capabilities: JSON.parse(capabilities.stdout).capabilities, resourceDirectory: dirname(path) };
       }
     }
     return null;
@@ -108,21 +156,33 @@ export class DeviceBezels {
     const images = chrome.images;
     const sizing = images?.sizing;
     if (!sizing || ![sizing.leftWidth, sizing.rightWidth, sizing.topHeight, sizing.bottomHeight].every((n) => finite(n, 256))) return null;
-    const left = sizing.leftWidth!, top = sizing.topHeight!;
+    let left = sizing.leftWidth!, top = sizing.topHeight!;
     const screenWidth = display.width / display.scale, screenHeight = display.height / display.scale;
-    const width = screenWidth + left + sizing.rightWidth!;
-    const height = screenHeight + top + sizing.bottomHeight!;
-    const files = {} as Record<BezelPart, string>;
+    let width = screenWidth + left + sizing.rightWidth!;
+    let height = screenHeight + top + sizing.bottomHeight!;
+    const files: ResolvedBezel["files"] = {};
     const sizes = {} as Record<BezelPart, { width: number; height: number }>;
-    for (const part of BEZEL_PARTS) {
+    const parts: BezelPart[] = typeof images?.composite === "string" ? ["composite"] : [...BEZEL_PARTS];
+    for (const part of parts) {
       const asset = images?.[part];
       if (typeof asset !== "string" || basename(asset) !== asset || !/^[\w .-]+$/.test(asset)) return null;
-      files[part] = join(directory, `${asset}.pdf`);
-      const size = pdfSize(await readFile(files[part]));
+      const path = join(directory, `${asset}.pdf`);
+      files[part] = { path, scale: Math.max(2, display.scale) };
+      const size = pdfSize(await readFile(path));
       if (!size) return null;
       sizes[part] = size;
     }
-    const layers = BEZEL_PARTS.map((id) => {
+    // A composite is already Apple's complete body. Its own page dimensions
+    // take precedence over nine-slice sizing: phone11 is 436×908 with a
+    // 402×874 opening at (17,17), not a 438×910 body with 18-point insets.
+    if (parts[0] === "composite") {
+      width = sizes.composite.width;
+      height = sizes.composite.height;
+      left = (width - screenWidth) / 2;
+      top = (height - screenHeight) / 2;
+      if (left < 0 || top < 0) return null;
+    }
+    const layers = parts.map((id) => {
       let { width: w, height: h } = sizes[id];
       let x = 0, y = 0;
       if (id === "top" || id === "bottom") {
@@ -137,8 +197,34 @@ export class DeviceBezels {
       return { id, x, y, width: w, height: h };
     });
     if (layers.some((layer) => !finite(layer.width) || !finite(layer.height))) return null;
+    const mask = display.framebufferMaskIdentifier ?? profile?.framebufferMask;
+    if (typeof mask === "string" && /^[A-Fa-f0-9-]{36}$/.test(mask)) {
+      const roots = [profile!.resourceDirectory, join(this.dependencies.deviceKitRoot ?? "/Library/Developer/DeviceKit", "FramebufferMasks")];
+      for (const root of roots) {
+        const path = join(root, `${mask}.pdf`);
+        const size = await readFile(path).then(pdfSize).catch(() => null);
+        if (size && Math.abs(size.width / size.height - screenWidth / screenHeight) < 0.001) {
+          files.mask = { path, scale: display.width / size.width };
+          break;
+        }
+      }
+    }
     const radius = Math.max(0, Number(display.cornerRadiusUL) || 0);
-    return { files, geometry: { source: "xcode", width, height, screen: { x: left, y: top, width: screenWidth, height: screenHeight, cornerRadius: radius }, layers } };
+    return { files, geometry: { source: "xcode", width, height, screen: { x: left, y: top, width: screenWidth, height: screenHeight, cornerRadius: radius, mask: !!files.mask }, layers } };
+  }
+
+  private temporaryDirectory(): Promise<string> {
+    return this.directory ??= mkdtemp(join(tmpdir(), "bb-device-bezels-"));
+  }
+
+  private pdfRenderer(): Promise<string | null> {
+    return this.renderer ??= (async () => {
+      const directory = await this.temporaryDirectory();
+      const source = join(directory, "render-pdf.swift"), binary = join(directory, "render-pdf");
+      await writeFile(source, PDF_RENDERER);
+      const result = await this.dependencies.exec("xcrun", ["swiftc", "-module-cache-path", join(directory, "module-cache"), "-O", source, "-o", binary], { timeoutMs: 60_000 });
+      return result.code === 0 ? binary : null;
+    })().catch(() => null);
   }
 
   private get(udid: string): Promise<ResolvedBezel | null> {
@@ -155,19 +241,22 @@ export class DeviceBezels {
     return (await this.get(udid))?.geometry ?? null;
   }
 
-  async image(udid: string, part: string): Promise<Buffer | null> {
-    if (!BEZEL_PARTS.includes(part as BezelPart)) return null;
-    const source = (await this.get(udid))?.files[part as BezelPart];
+  async image(udid: string, part: string, rotation = 0): Promise<Buffer | null> {
+    if (![0, 90, 180, 270].includes(rotation)) return null;
+    if (part !== "mask" && part !== "composite" && !BEZEL_PARTS.includes(part as (typeof BEZEL_PARTS)[number])) return null;
+    const source = (await this.get(udid))?.files[part as BezelPart | "mask"];
     if (!source || this.disposed) return null;
-    let image = this.images.get(source);
+    const key = `${source.path}:${source.scale}:${rotation}`;
+    let image = this.images.get(key);
     if (!image) {
       image = (async () => {
-        this.directory ??= mkdtemp(join(tmpdir(), "bb-device-bezels-"));
-        const path = join(await this.directory, `${createHash("sha256").update(source).digest("hex")}.png`);
-        const result = await this.dependencies.exec("/usr/bin/sips", ["-s", "format", "png", source, "--out", path], { timeoutMs: 15_000 });
+        const renderer = await this.pdfRenderer();
+        if (!renderer) return null;
+        const path = join(await this.temporaryDirectory(), `${createHash("sha256").update(key).digest("hex")}.png`);
+        const result = await this.dependencies.exec(renderer, [source.path, String(source.scale), String(rotation), path], { timeoutMs: 15_000 });
         return result.code === 0 ? readFile(path) : null;
       })().catch(() => null);
-      this.images.set(source, image);
+      this.images.set(key, image);
     }
     return image;
   }
@@ -185,7 +274,7 @@ export function registerDeviceBezels(bb: BbPluginApi, dependencies: BezelDepende
   const bezels = new DeviceBezels(dependencies);
   bb.http.route("GET", "/bezel", async (c) => c.json(await bezels.geometry(c.req.query("udid") ?? "")));
   bb.http.route("GET", "/bezel/image", async (c) => {
-    const png = await bezels.image(c.req.query("udid") ?? "", c.req.query("part") ?? "");
+    const png = await bezels.image(c.req.query("udid") ?? "", c.req.query("part") ?? "", Number(c.req.query("rotation") ?? 0));
     return png ? new Response(new Uint8Array(png), { headers: { "content-type": "image/png", "cache-control": "private, max-age=3600" } })
       : c.json({ error: "The local Xcode bezel is unavailable." }, 404);
   });

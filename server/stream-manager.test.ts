@@ -1,7 +1,9 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import type { ChildProcess } from "node:child_process";
+import type { WebSocket } from "ws";
 import { StreamManager, resolveNodeCommand, resolveServeSimEntry } from "./stream-manager";
+import { HID, decodeHid } from "../lib/sim-protocol";
 
 const log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
 
@@ -24,6 +26,7 @@ function manager(options: {
   child?: FakeChild;
   healthyAfter?: number;
   node?: ReturnType<typeof resolveNodeCommand>;
+  webSocket?: typeof WebSocket;
 }) {
   const child = options.child ?? new FakeChild();
   const spawn = vi.fn(() => child as unknown as ChildProcess);
@@ -50,6 +53,7 @@ function manager(options: {
     onChange,
     healthTimeoutMs: 2_000,
     pollIntervalMs: 5,
+    webSocket: options.webSocket,
   });
   return { streams, spawn, fetchFn, child, onChange };
 }
@@ -80,6 +84,116 @@ describe("resolveNodeCommand", () => {
     expect(
       resolveNodeCommand({ env: { PATH: "" }, home: "/x", executable: () => false, isElectron: false, execPath: "/x/bun" }),
     ).toBeNull();
+  });
+});
+
+function fakeWebSockets(autoOpen = true) {
+  const sockets: FakeSocket[] = [];
+  class FakeSocket extends EventEmitter {
+    readonly OPEN = 1;
+    readonly CONNECTING = 0;
+    readyState = 0;
+    binaryType = "";
+    sent: Uint8Array[] = [];
+    closes = 0;
+    constructor(readonly url: string) {
+      super(); sockets.push(this);
+      if (autoOpen) queueMicrotask(() => this.open());
+    }
+    open() { if (this.readyState === 0) { this.readyState = 1; this.emit("open"); } }
+    send(data: Uint8Array) { this.sent.push(data); }
+    close() {
+      if (this.readyState === 3) return;
+      this.closes++; this.readyState = 3;
+      queueMicrotask(() => this.emit("close"));
+    }
+    terminate() { this.close(); }
+  }
+  return { sockets, WebSocket: FakeSocket as unknown as typeof WebSocket };
+}
+
+describe("session-owned HID controls", () => {
+  it("shares a persistent connection across concurrent and later actions", async () => {
+    const fake = fakeWebSockets();
+    const { streams } = manager({ webSocket: fake.WebSocket });
+    await streams.ensure("UDID");
+    const send = () => streams.withHid("UDID", async (hid) => hid.send(HID.BUTTON, { button: "home" }));
+    await Promise.all([send(), send()]); await send();
+    expect(fake.sockets).toHaveLength(1);
+    expect(fake.sockets[0]!.sent.map((data) => decodeHid(data)?.payload)).toEqual([
+      { button: "home" }, { button: "home" }, { button: "home" },
+    ]);
+    expect(fake.sockets[0]!.closes).toBe(0);
+    await streams.stop("UDID");
+    expect(fake.sockets[0]!.closes).toBe(1);
+  });
+
+  it("reconnects for the next action after closure without replaying an earlier action", async () => {
+    const fake = fakeWebSockets();
+    const { streams } = manager({ webSocket: fake.WebSocket });
+    await streams.ensure("UDID");
+    await streams.withHid("UDID", async (hid) => hid.send(HID.BUTTON, { button: "home" }));
+    fake.sockets[0]!.close(); await Promise.resolve();
+    await streams.withHid("UDID", async (hid) => hid.send(HID.BUTTON, { button: "lock" }));
+    expect(fake.sockets).toHaveLength(2);
+    expect(fake.sockets.map((socket) => socket.sent.map((data) => decodeHid(data)?.payload)))
+      .toEqual([[{ button: "home" }], [{ button: "lock" }]]);
+    await streams.stopAll();
+    expect(fake.sockets.every((socket) => socket.closes === 1)).toBe(true);
+  });
+
+  it("reports a disconnected send instead of silently dropping the action", async () => {
+    const fake = fakeWebSockets();
+    const { streams } = manager({ webSocket: fake.WebSocket });
+    await streams.ensure("UDID");
+    await expect(streams.withHid("UDID", async (hid) => {
+      fake.sockets[0]!.close();
+      hid.send(HID.BUTTON, { button: "home" });
+    })).rejects.toThrow("input connection closed");
+    expect(fake.sockets[0]!.sent).toHaveLength(0);
+    await streams.stopAll();
+  });
+
+  it("closes both the control and browser-relay sockets when the helper exits", async () => {
+    const fake = fakeWebSockets();
+    const { streams, child } = manager({ webSocket: fake.WebSocket });
+    await streams.ensure("UDID");
+    await streams.withHid("UDID", async () => {});
+    const browserRelay = await streams.openHid("UDID");
+    const onClose = vi.fn(); browserRelay.onClose(onClose);
+    child.emit("exit", 1, null); await Promise.resolve();
+    expect(fake.sockets).toHaveLength(2);
+    expect(fake.sockets.every((socket) => socket.closes === 1)).toBe(true);
+    expect(onClose).toHaveBeenCalledOnce();
+    await expect(streams.withHid("UDID", async () => {})).rejects.toThrow("No stream");
+  });
+
+  it("cancels an action waiting for the shared connection without cancelling other callers", async () => {
+    const fake = fakeWebSockets(false);
+    const { streams } = manager({ webSocket: fake.WebSocket });
+    await streams.ensure("UDID");
+    const controller = new AbortController();
+    const cancelledWork = vi.fn(async () => {}), otherWork = vi.fn(async () => {});
+    const cancelled = streams.withHid("UDID", cancelledWork, controller.signal).catch((error) => error);
+    const other = streams.withHid("UDID", otherWork);
+    controller.abort();
+    expect(await cancelled).toBeInstanceOf(DOMException);
+    expect(cancelledWork).not.toHaveBeenCalled();
+    fake.sockets[0]!.open(); await other;
+    expect(fake.sockets).toHaveLength(1); expect(otherWork).toHaveBeenCalledOnce();
+    await streams.stopAll();
+  });
+
+  it("aborts a pending connection when its simulator session stops", async () => {
+    const fake = fakeWebSockets(false);
+    const { streams } = manager({ webSocket: fake.WebSocket });
+    await streams.ensure("UDID");
+    const work = vi.fn(async () => {});
+    const pending = streams.withHid("UDID", work).catch((error) => error);
+    await streams.stop("UDID");
+    expect(await pending).toBeInstanceOf(Error);
+    expect(work).not.toHaveBeenCalled();
+    expect(fake.sockets[0]!.closes).toBe(1);
   });
 });
 

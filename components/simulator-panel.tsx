@@ -27,10 +27,11 @@ import {
   nextOrientation,
   screenConfigFrom,
   type HardwareButton,
+  type Orientation,
   type ScreenConfig,
 } from "@/lib/sim-protocol";
 import { cn } from "@/lib/utils";
-import { fitBezel, isDeviceBezel, type DeviceBezel } from "@/lib/device-bezel";
+import { BEZEL_ASSET_VERSION, fitBezel, isDeviceBezel, type DeviceBezel } from "@/lib/device-bezel";
 import { startVideoStream, webCodecsAvailable, type VideoStats } from "@/components/video-stream";
 
 type Device = SimulatorState["devices"][number];
@@ -233,12 +234,18 @@ function DeviceScreen({
       if (!response.ok) return;
       const frame: unknown = await response.json();
       if (!isDeviceBezel(frame) || controller.signal.aborted) return;
-      await Promise.all(frame.layers.map((layer) => new Promise<void>((resolve, reject) => {
+      const urls = frame.layers.map((layer) => `${base}/bezel/image?udid=${encodeURIComponent(udid)}&part=${layer.id}&v=${BEZEL_ASSET_VERSION}`);
+      if (frame.screen.mask) {
+        for (const rotation of [0, 90, 180, 270]) {
+          urls.push(`${base}/bezel/image?udid=${encodeURIComponent(udid)}&part=mask&rotation=${rotation}&v=${BEZEL_ASSET_VERSION}`);
+        }
+      }
+      await Promise.all(urls.map((url) => new Promise<void>((resolve, reject) => {
         const image = new Image();
         images.push(image);
         image.onload = () => resolve();
         image.onerror = () => reject(new Error("Local bezel image unavailable"));
-        image.src = `${base}/bezel/image?udid=${encodeURIComponent(udid)}&part=${layer.id}`;
+        image.src = url;
       })));
       if (!controller.signal.aborted) setBezel(frame);
     };
@@ -281,6 +288,7 @@ function DeviceScreen({
     let attempt = 0;
     const connect = () => {
       if (disposed) return;
+      handle?.stop();
       handle = startVideoStream(
         `${base}/video?udid=${encodeURIComponent(udid)}&s=${session.startedAt}&a=${attempt}`,
         canvas,
@@ -410,7 +418,7 @@ function DeviceScreen({
           }}>
             {bezel.layers.map((layer) => (
               <img key={layer.id} alt="" draggable={false} className="absolute select-none"
-                src={`${base}/bezel/image?udid=${encodeURIComponent(udid)}&part=${layer.id}`}
+                src={`${base}/bezel/image?udid=${encodeURIComponent(udid)}&part=${layer.id}&v=${BEZEL_ASSET_VERSION}`}
                 onError={() => setBezel(null)}
                 style={{ left: layer.x * localFit.scale, top: layer.y * localFit.scale,
                   width: layer.width * localFit.scale, height: layer.height * localFit.scale }} />
@@ -431,7 +439,11 @@ function DeviceScreen({
         aria-label="Simulator screen. Click to tap, drag to swipe, type to send keys."
         className="absolute overflow-hidden bg-black outline-none ring-ring focus-visible:ring-2"
         style={{ width, height, left: localFit?.screenX ?? fit.bezel, top: localFit?.screenY ?? fit.bezel,
-          borderRadius: localFit?.screenRadius ?? fit.screenRadius, touchAction: "none" }}
+          borderRadius: bezel?.screen.mask ? 0 : (localFit?.screenRadius ?? fit.screenRadius), touchAction: "none",
+          ...(bezel?.screen.mask && localFit ? {
+            maskImage: `url("${base}/bezel/image?udid=${encodeURIComponent(udid)}&part=mask&rotation=${localFit.angle}&v=${BEZEL_ASSET_VERSION}")`,
+            maskSize: "100% 100%", maskMode: "alpha", maskRepeat: "no-repeat",
+          } : {}) }}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
@@ -505,22 +517,25 @@ function ControlButton({
   onClick,
   disabled,
   destructive,
+  pending,
 }: {
   icon: string;
   label: string;
   onClick: () => void;
   disabled?: boolean;
   destructive?: boolean;
+  pending?: boolean;
 }) {
   return (
-    <span title={label} className="inline-flex">
+    <span title={label} className="inline-flex shrink-0">
       <Button
         variant="ghost"
         size="icon"
-        className={cn("size-10 text-muted-foreground transition-transform hover:text-foreground active:scale-[0.96]", destructive && "hover:text-destructive")}
+        className={cn("size-10 shrink-0 text-muted-foreground transition-transform hover:text-foreground active:scale-[0.96]", pending && "bg-accent text-foreground", destructive && "hover:text-destructive")}
         aria-label={label}
+        aria-busy={pending || undefined}
         onClick={onClick}
-        disabled={disabled}
+        disabled={disabled || pending}
       >
         <Icon name={icon} className="size-4" />
       </Button>
@@ -546,6 +561,9 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
   const [activity, setActivity] = useState<Record<string, number>>({});
   const [screen, setScreen] = useState<ScreenConfig | null>(null);
   const [videoStats, setVideoStats] = useState<VideoStats | null>(null);
+  const [pendingControls, setPendingControls] = useState<Record<string, boolean>>({});
+  const controlsInFlight = useRef(new Set<string>());
+  const requestedOrientation = useRef<{ udid: string; orientation: Orientation } | null>(null);
   const [, tick] = useState(0);
 
   const refetch = useCallback(() => {
@@ -592,6 +610,13 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
   const agentActive =
     activeUdid !== null && Date.now() - (activity[activeUdid] ?? 0) < AGENT_BADGE_MS;
 
+  useEffect(() => {
+    const requested = requestedOrientation.current;
+    if (requested && (requested.udid !== activeUdid || requested.orientation === screen?.orientation)) {
+      requestedOrientation.current = null;
+    }
+  }, [activeUdid, screen?.orientation]);
+
   const run = useCallback(
     async (label: string, work: () => Promise<unknown>) => {
       setBusy(label);
@@ -620,13 +645,36 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
   };
   const pressButton = (button: HardwareButton) => {
     if (!activeUdid) return;
-    rpc.call("button", { udid: activeUdid, button }).catch((cause) => toast.error(describe(cause)));
+    void runControl(button, () => rpc.call("button", { udid: activeUdid, button }));
   };
   const rotate = () => {
-    if (!activeUdid) return;
-    rpc
-      .call("rotate", { udid: activeUdid, orientation: nextOrientation(screen?.orientation) })
-      .catch((cause) => toast.error(describe(cause)));
+    if (!activeUdid || controlsInFlight.current.has(`${activeUdid}:rotate`)) return;
+    // Config arrives asynchronously; rapid presses should advance from the
+    // requested orientation instead of sending the same rotation twice.
+    const previous = requestedOrientation.current?.udid === activeUdid
+      ? requestedOrientation.current.orientation : screen?.orientation;
+    const requested = { udid: activeUdid, orientation: nextOrientation(previous) };
+    requestedOrientation.current = requested;
+    void runControl("rotate", async () => {
+      try { await rpc.call("rotate", requested); }
+      catch (error) {
+        if (requestedOrientation.current === requested) requestedOrientation.current = null;
+        throw error;
+      }
+    });
+  };
+  const controlPending = (action: string) => pendingControls[`${activeUdid}:${action}`] === true;
+  const runControl = async (action: string, work: () => Promise<unknown>) => {
+    const key = `${activeUdid}:${action}`;
+    if (controlsInFlight.current.has(key)) return;
+    controlsInFlight.current.add(key);
+    setPendingControls((previous) => ({ ...previous, [key]: true }));
+    try { await work(); }
+    catch (cause) { toast.error(describe(cause)); }
+    finally {
+      controlsInFlight.current.delete(key);
+      setPendingControls((previous) => { const next = { ...previous }; delete next[key]; return next; });
+    }
   };
   const screenshot = () => {
     if (!activeUdid) return;
@@ -803,22 +851,15 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
       )}
 
       {activeSession && activeUdid ? (
-        <div className="flex flex-wrap items-center gap-1 border-t border-border px-2 py-1.5">
-          <ControlButton icon={glyph("home")} label="Home (⌘⇧H)" onClick={() => pressButton("home")} />
-          <ControlButton icon={glyph("lock")} label="Lock (⌘L)" onClick={() => pressButton("lock")} />
-          <ControlButton icon={glyph("volume-up")} label="Volume up (⌘↑)" onClick={() => pressButton("volume-up")} />
-          <ControlButton icon={glyph("volume-down")} label="Volume down (⌘↓)" onClick={() => pressButton("volume-down")} />
-          <ControlButton icon={glyph("rotate")} label="Rotate (⌘→)" onClick={rotate} />
+        <div className="shrink-0 border-t border-border px-2 py-1.5">
+          <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Simulator controls">
+          <ControlButton icon={glyph("home")} label="Home (⌘⇧H)" onClick={() => pressButton("home")} pending={controlPending("home")} />
+          <ControlButton icon={glyph("lock")} label="Lock (⌘L)" onClick={() => pressButton("lock")} pending={controlPending("lock")} />
+          <ControlButton icon={glyph("volume-up")} label="Volume up (⌘↑)" onClick={() => pressButton("volume-up")} pending={controlPending("volume-up")} />
+          <ControlButton icon={glyph("volume-down")} label="Volume down (⌘↓)" onClick={() => pressButton("volume-down")} pending={controlPending("volume-down")} />
+          <ControlButton icon={glyph("rotate")} label="Rotate (⌘→)" onClick={rotate} pending={controlPending("rotate")} />
           <ControlButton icon={glyph("camera")} label="Save screenshot (⌘S)" onClick={screenshot} />
-          <span
-            className="min-w-0 flex-1 truncate px-1 font-mono text-[11px] text-muted-foreground"
-            title="Codec · painted frames per second (decoded) · decoder queue · stream bandwidth"
-          >
-            {videoStats
-              ? `H.264 · ${videoStats.paintedFps} fps (${videoStats.decodedFps}) · q${videoStats.queue} · ${Math.round(videoStats.bytesPerSecond / 1024)} KB/s`
-              : "MJPEG fallback"}
-            {screen ? ` · ${screen.width}×${screen.height}` : ""}
-          </span>
+          <span className="flex-1" />
           {state?.agentControl === "ask" ? (
             <Button
               size="sm"
@@ -840,6 +881,16 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
             disabled={busy !== null}
             destructive
           />
+          </div>
+          <div
+            className="h-4 truncate px-1 font-mono text-[11px] leading-4 text-muted-foreground"
+            title="Codec · painted frames per second (decoded) · decoder queue · stream bandwidth"
+          >
+            {videoStats
+              ? `H.264 · ${videoStats.paintedFps} fps (${videoStats.decodedFps}) · q${videoStats.queue} · ${Math.round(videoStats.bytesPerSecond / 1024)} KB/s`
+              : "MJPEG fallback"}
+            {screen ? ` · ${screen.width}×${screen.height}` : ""}
+          </div>
         </div>
       ) : null}
     </div>
