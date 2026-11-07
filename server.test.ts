@@ -1,3 +1,4 @@
+import { writeFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { createPlugin } from "./server";
@@ -161,6 +162,40 @@ describe("iOS Simulator plugin", () => {
     expect(sent[1]!.payload).toMatchObject({ type: "end" });
     const activity = harness.realtimeSignals.filter((signal) => signal.channel === "agent-activity");
     expect(activity.map((signal) => (signal.payload as { active: boolean }).active)).toEqual([true, false]);
+  });
+
+  it("annotates a frozen screen: snapshot, stored note, and the agent's mention", async () => {
+    const { harness } = await load({
+      execScript: (file, args) => {
+        if (file === "xcrun" && args[1] === "io") { writeFileSync(args.at(-1)!, "png"); return {}; }
+        if (file === "sips") { writeFileSync(args[args.indexOf("--out") + 1]!, Buffer.from([0xff, 0xd8, 0xff, 0xe0])); return {}; }
+        return undefined;
+      },
+    });
+    const { udid } = await harness.behavior.callRpc("attach", { threadId: "thr_1", device: null }) as { udid: string };
+    const snapshot = await harness.behavior.callRpc("annotateSnapshot", { threadId: "thr_1", udid }) as {
+      screen: unknown; image: { mimeType: string }; tree: { children: Array<{ label: string }> };
+    };
+    expect(snapshot.screen).toEqual({ width: 393, height: 852 });
+    expect(snapshot.image.mimeType).toBe("image/jpeg");
+    expect(snapshot.tree.children[0]!.label).toBe("Sign in");
+    await expect(harness.behavior.callRpc("annotateSnapshot", { threadId: "thr_other", udid })).rejects.toThrow(/Attach/);
+
+    const note = {
+      id: "nabc1234", number: 1, comment: "Make it green", udid, device: "iPhone 17 Pro", runtime: "iOS 26.0", app: null,
+      element: { type: "Button", label: "Sign in", identifier: "sign-in", value: null,
+        frame: { x: 96, y: 700, width: 200, height: 50 }, ancestors: ["Group"], screen: { width: 393, height: 852 } },
+    };
+    await harness.behavior.callRpc("annotateSaveNote", { threadId: "thr_1", note });
+    expect(await harness.behavior.callRpc("annotateGetNotes", { threadId: "thr_1", ids: ["nabc1234"] })).toEqual([note]);
+    expect(await harness.behavior.callRpc("annotateGetNotes", { threadId: "thr_other", ids: ["nabc1234"] })).toEqual([]);
+    await expect(harness.behavior.callRpc("annotateSaveNoteImage", { threadId: "thr_1", id: "nabc1234", base64: Buffer.from("png").toString("base64") }))
+      .rejects.toThrow(/JPEG/);
+
+    const provider = harness.registrations.mentionProviders.find((entry) => entry.id === "simulator-note");
+    const resolved = await provider!.resolve("nabc1234", CTX as never) as { context: string };
+    expect(resolved.context).toContain("# Simulator note 1");
+    expect(resolved.context).toContain("`sign-in` (in React Native and Expo, the `testID` prop");
   });
 
   it("explains the screenshot fallback when Xcode returns an empty accessibility response", async () => {

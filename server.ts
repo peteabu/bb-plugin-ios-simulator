@@ -41,6 +41,14 @@ import { registerDeviceBezels } from "./server/device-bezel";
 import { ControlLeases } from "./server/control";
 import { ReplayRecorder } from "./server/replay";
 import type { TimelineEvent } from "./lib/session-types";
+import {
+  MAX_NOTE_IMAGE_BASE64,
+  annotateNoteSchema,
+  annotateSnapshotSchema,
+  noteIdSchema,
+  readAnnotateSnapshot,
+  registerAnnotateNotes,
+} from "./server/annotate";
 
 export const AGENT_CONTROL_MODES = ["ask", "always", "never"] as const;
 export type AgentControlMode = (typeof AGENT_CONTROL_MODES)[number];
@@ -144,6 +152,20 @@ export const rpcContract = defineRpcContract({
   },
   replayState: {
     input: z.object({ threadId: z.string(), udid: z.string() }).strict(), output: replaySchema,
+  },
+  annotateSnapshot: {
+    input: z.object({ threadId: z.string(), udid: z.string() }).strict(), output: annotateSnapshotSchema,
+  },
+  annotateSaveNote: {
+    input: z.object({ threadId: z.string(), note: annotateNoteSchema }).strict(), output: z.null(),
+  },
+  annotateGetNotes: {
+    input: z.object({ threadId: z.string(), ids: z.array(noteIdSchema).max(200) }).strict(),
+    output: z.array(annotateNoteSchema),
+  },
+  annotateSaveNoteImage: {
+    input: z.object({ threadId: z.string(), id: noteIdSchema, base64: z.string().max(MAX_NOTE_IMAGE_BASE64) }).strict(),
+    output: z.null(),
   },
 });
 
@@ -302,6 +324,7 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       finally { operation.release(); }
     }
     registerAndroid(bb, { agentControl: () => normalizeAgentControl(current.agentControl) });
+    const notes = registerAnnotateNotes(bb);
     registerDeviceBezels(bb, { exec, simctl });
 
     async function readiness(): Promise<SimulatorState["ready"]> {
@@ -438,6 +461,34 @@ export function createPlugin(dependencies: PluginDependencies = {}) {
       async replayState({ threadId, udid }) {
         assertAttached(threadId, udid);
         return replay.status(udid, threadId);
+      },
+      async annotateSnapshot({ threadId, udid }) {
+        assertAttached(threadId, udid);
+        if (!streams.get(udid)) throw new SimulatorError("Attach the simulator before annotating.");
+        const device = (await service.devices()).find((entry) => entry.udid === udid);
+        if (!device) throw new SimulatorError("This simulator is no longer available.");
+        try {
+          return await readAnnotateSnapshot(device, {
+            screenshot: (signal) => service.screenshot(udid, signal),
+            accessibility: (signal) => streams.rawAccessibility(udid, signal),
+          });
+        } catch (error) {
+          if (/noFrontmostApplication/.test(describe(error))) {
+            throw new SimulatorError("No app is in front on this simulator, so there is nothing to annotate.");
+          }
+          throw error;
+        }
+      },
+      async annotateSaveNote({ threadId, note }) {
+        notes.save(threadId, note);
+        return null;
+      },
+      async annotateGetNotes({ threadId, ids }) {
+        return notes.get(threadId, ids);
+      },
+      async annotateSaveNoteImage({ threadId, id, base64 }) {
+        await notes.saveImage(threadId, id, base64);
+        return null;
       },
     });
 

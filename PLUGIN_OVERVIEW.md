@@ -13,6 +13,15 @@ screen and hardware buttons, then **Let agent drive** to hand it back. One
 thread controls each iOS device; other attached threads can observe. Taking
 control cancels the previous driver's pending input.
 
+## Annotate for the agent
+
+Choose **Annotate** in the control dock to freeze the screen and point at an
+element: a blue box shows its type, label, identifier, and size, and **↑**
+selects its parent. Click it, write a note, and a pill such as `1 · Buy Pro`
+lands in the composer. The agent gets the note, the element's identifier (the
+React Native / Expo `testID`), frame, and ancestors, and a screenshot with the
+element outlined.
+
 ## Replay and activity
 
 Capture up to the last 30 seconds of iOS video, then play, pause, scrub or jump

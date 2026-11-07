@@ -14,6 +14,7 @@ import {
 import { DeviceConsentForm } from "@/components/device-consent";
 import { SimulatorPanel } from "@/components/simulator-panel";
 import { AndroidPanel } from "@/components/android-panel";
+import { canToggleAnnotate, toggleAnnotate } from "@/components/annotate";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 
@@ -105,5 +106,14 @@ export default definePluginApp((app) => {
   app.slots.pendingInteraction({
     id: "device-consent",
     component: DeviceConsentForm,
+  });
+  // No default keys: users bind it under Keyboard shortcuts.
+  app.commands.register({
+    id: "annotate",
+    title: "iOS Simulator: Annotate an element",
+    isAvailable: ({ threadId }) => threadId !== null && canToggleAnnotate(threadId),
+    run: ({ threadId }) => {
+      if (threadId) toggleAnnotate(threadId);
+    },
   });
 });

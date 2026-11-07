@@ -36,6 +36,7 @@ import { displayPointToRaw, screenGeometry } from "@/lib/screen-geometry";
 import { startVideoStream, webCodecsAvailable, type VideoStats } from "@/components/video-stream";
 import { ReplayPanel } from "@/components/replay-panel";
 import { DevicePicker } from "@/components/device-picker";
+import { useAnnotate } from "@/components/annotate";
 
 type Session = SimulatorState["sessions"][number];
 
@@ -190,6 +191,7 @@ function DeviceScreen({
   onConfig,
   onStats,
   onPasteText,
+  annotate,
 }: {
   threadId: string;
   udid: string;
@@ -204,6 +206,7 @@ function DeviceScreen({
   onConfig: (config: ScreenConfig | null) => void;
   onStats: (stats: VideoStats | null) => void;
   onPasteText: (text: string) => void;
+  annotate?: (size: { width: number; height: number }) => { screen: ReactNode; layer: ReactNode } | null;
 }) {
   const { send: sendHid, config, connected } = useHidSocket(hidSocketUrl(base, udid, threadId), controlVersion);
   const send = useCallback((opcode: number, payload: unknown) => {
@@ -361,6 +364,9 @@ function DeviceScreen({
     left: (width - contentWidth) / 2, top: (height - contentHeight) / 2,
     transform: `rotate(${geometry.contentRotation}deg)`, transformOrigin: "center",
   };
+
+  // Annotate draws a frozen portrait screen; a rotated screen has none.
+  const annotation = geometry.contentRotation === 0 ? annotate?.({ width, height }) ?? null : null;
 
   const normalized = (event: ReactPointerEvent<HTMLElement>) => {
     const rect = surfaceRef.current?.getBoundingClientRect();
@@ -550,7 +556,13 @@ function DeviceScreen({
             Reconnecting input…
           </div>
         ) : null}
+        {annotation?.screen}
       </div>
+      {annotation ? (
+        <div className="absolute" style={{ width, height, left: localFit?.screenX ?? fit.bezel, top: localFit?.screenY ?? fit.bezel }}>
+          {annotation.layer}
+        </div>
+      ) : null}
       </div>
     </div>
   );
@@ -562,21 +574,24 @@ function ControlButton({
   onClick,
   disabled,
   pending,
+  pressed,
 }: {
   icon: string;
   label: string;
   onClick: () => void;
   disabled?: boolean;
   pending?: boolean;
+  pressed?: boolean;
 }) {
   return (
     <span title={label} className="inline-flex shrink-0">
       <Button
         variant="ghost"
         size="icon"
-        className={cn("size-10 shrink-0 rounded-lg text-muted-foreground transition-[background-color,color,transform] duration-150 hover:text-foreground active:scale-[0.96] motion-reduce:transition-none", pending && "bg-accent text-foreground")}
+        className={cn("size-10 shrink-0 rounded-lg text-muted-foreground transition-[background-color,color,transform] duration-150 hover:text-foreground active:scale-[0.96] motion-reduce:transition-none", (pending || pressed) && "bg-accent text-foreground")}
         aria-label={label}
         aria-busy={pending || undefined}
+        aria-pressed={pressed}
         onClick={onClick}
         disabled={disabled || pending}
       >
@@ -798,6 +813,10 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
     });
   };
 
+  const annotateEnabled = isAttached && activeSession !== null && !replaying
+    && (screen?.orientation ?? "portrait") === "portrait";
+  const annotate = useAnnotate(threadId, activeUdid, annotateEnabled);
+
   const problems = state?.ready.problems ?? [];
   const inputShadowed = activeUdid !== null && (state?.inputShadowed ?? []).includes(activeUdid);
   const liveStage = activeSession && activeUdid ? <DeviceScreen
@@ -809,6 +828,7 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
     onPasteText={(text) => {
       if (canDrive) rpc.call("pasteText", { threadId, udid: activeUdid, text }).catch((cause) => toast.error(describe(cause)));
     }}
+    annotate={annotate.render}
   /> : null;
 
   return (
@@ -923,6 +943,8 @@ export function SimulatorPanel({ threadId }: PluginThreadPanelProps) {
           <ControlButton icon={glyph("lock")} label="Lock (⌘L)" onClick={() => pressButton("lock")} disabled={!canDrive} pending={controlPending("lock")} />
           <ControlButton icon={glyph("rotate")} label="Rotate (⌘→)" onClick={rotate} disabled={!canDrive} pending={controlPending("rotate")} />
           <ControlButton icon={glyph("camera")} label="Save screenshot (⌘S)" onClick={screenshot} />
+          <ControlButton icon={glyph("annotate")} label={annotate.active ? "Stop annotating (Esc)" : "Annotate an element for the agent"}
+            onClick={annotate.toggle} disabled={!annotateEnabled} pending={annotate.loading} pressed={annotate.active} />
           <span aria-hidden="true" className="mx-1 h-4 w-px bg-border/60" />
           <DeviceOptions key={activeUdid}>
             <div className="flex items-center justify-between gap-2 rounded-lg px-2 py-1">

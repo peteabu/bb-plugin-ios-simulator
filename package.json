@@ -13,6 +13,7 @@
     "branding": {
       "icon": "Smartphone",
       "experimental_icons": {
+        "annotate": "./icons/annotate.svg",
         "camera": "./icons/camera.svg",
         "home": "./icons/home.svg",
         "lock": "./icons/lock.svg",

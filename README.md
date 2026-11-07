@@ -8,6 +8,10 @@ build, launch, and test on the same device.
   including Unicode and multiline text. Choose **Take control** before using
   the screen, then **Let agent drive** to hand it back. ⌘⇧H goes home, ⌘L locks, ⌘↑/↓ changes
   volume, ⌘→ rotates, and ⌘S saves a PNG.
+- **Annotate.** Choose Annotate in the control dock to freeze the screen,
+  point at an element, and click it to write a note. The note reaches the
+  agent as a composer pill with the element's type, label, identifier (the
+  React Native / Expo `testID`), frame, and a marked screenshot.
 - **Thread shortcut.** The Simulator button in the thread header opens the
   panel. Attaching a device from an agent also opens it automatically.
 - **Device frame.** The panel uses the selected simulator's local Xcode device
@@ -108,6 +112,33 @@ CLI equivalents:
 bb ios-simulator session [device] --thread <thread-id>
 bb ios-simulator replay [device] --thread <thread-id>
 ```
+
+## Annotate
+
+Annotate turns "this button" into something an agent can find in the code.
+Choose **Annotate** in the control dock of an attached iOS device. The panel
+freezes the current screen and reads its accessibility tree at the same
+moment. Point at an element: a blue box and a label show its type, label,
+identifier, and size. **↑** selects its parent and **↓** goes back. Click the
+element and write a note; **Enter** adds it, **Shift+Enter** starts a new line,
+and **Escape** cancels. The panel returns to the live stream, and a pill such
+as `1 · Buy Pro` appears in the thread's composer. Annotate again for the next
+note, then send your message. While annotating, click a numbered pin to edit
+or delete its note; deleting a pill removes its note.
+
+For each pill the agent reads the note, the device and app, and the element's
+type, label, identifier, value, frame in points, and ancestors, plus a JPEG of
+the screen with the element outlined and pinned. In React Native and Expo the
+identifier is the `testID` prop, so the agent can find the component with a
+single search. Only accessible elements can be picked; a plain `View` without
+`testID`, `accessible`, or a label is not in the tree.
+
+Annotate reads the screen without input, so observers can use it too. It
+works in portrait orientation. **iOS Simulator: Annotate an element** in the
+command palette toggles it; it has no default shortcut, so bind one under
+Keyboard shortcuts if you use it often. Notes are kept in the plugin's
+database and their screenshots in the thread's storage; deleting the thread
+removes them.
 
 ## How it works
 
